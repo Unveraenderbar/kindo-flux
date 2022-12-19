@@ -43,12 +43,13 @@ gitoliteFluxKeyFile="${GITOSSH_FLUX_KEY_FILE:-$kindTmpDir/$fluxNamespace.ecdsa}"
 gitoliteFluxPubKeyFile="$gitoliteAdminClone/keydir/$fluxNamespace.pub"
 fluxCloneDir="${KIND_FLUX_CLONE_DIR:-$kindTmpDir/$fluxNamespace}"
 
-vclusterNodePort="$((${VCLUSTER_PORT:-30333} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
-
 # ArgoCD related parameters:
 argoCdNamespace="${KIND_FLUX_NAMESPACE:-argocd}"
 argoCdVersion="${ARGOCD_VERSION:-stable}"
 argoCdUrl="https://raw.githubusercontent.com/argoproj/argo-cd/$argoCdVersion/manifests/install.yaml"
+argocdNodePort="$((${ARGOCD_NODE_PORT:-${nodePortPrefix}0333} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
+
+vclusterNodePort="$((${VCLUSTER_NODE_PORT:-${nodePortPrefix}0444} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
 
 fluxWaitForKustomization() {
     kubeCtl() { kubectl -n "$fluxNamespace" "$@"; }
@@ -186,7 +187,10 @@ nodes:
   - containerPort: $opensshNodePort
     hostPort: $opensshNodePort
     protocol: TCP
-  - containerPort: 443
+  - containerPort: $argocdNodePort
+    hostPort: $argocdNodePort
+    protocol: TCP
+  - containerPort: $vclusterNodePort
     hostPort: $vclusterNodePort
     protocol: TCP
 $(seq 1 "${KIND_NUM_NODES:-2}" | xargs -rn1 sh -c "printf -- \"- role: worker\n\"")
@@ -450,30 +454,17 @@ fluxAddComponent argocd "$argoCdUrl" 'ArgoCD GitOps toolkit' "$argoCdNamespace" 
 					  patch: |-
 					    - op: replace
 					      path: '/metadata/namespace'
-					      value: $fluxNamespace" # ... but namespace for kustomization must be that of Flux 
-tee "${KIND_ARGOCD_DEPLOYMENT_DEBUG:-/dev/stderr}" <<-EOF | kubectl -n "$argoCdNamespace" apply -f -
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: argocd-server-ingress
-  namespace: argocd
-  annotations:
-    kubernetes.io/ingress.class: nginx
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
-spec:
-  rules:
-  - http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: argocd-server
-            port:
-              name: https
-EOF
+					      value: $fluxNamespace  # ... but namespace for kustomization must be that of Flux 
+					- target:
+					    kind: Service
+					    name: argocd-server
+					  patch: |-
+					    - op: replace
+					      path: '/spec/type'
+					      value: NodePort
+					    - op: add
+					      path: '/spec/ports/1/nodePort'
+					      value: $argocdNodePort"
 
 ## phase 4 clean up, show k8s pod status and print some useful commands for
 #          interaction w/ cluster / FluxCD via gitolite / argocd CLI, using
@@ -488,5 +479,4 @@ kubectl get pod -A
 printf "\nexport KUBECONFIG='%s'\n" "$kubeConfig"
 gitolitePrintCloneCmd "$gitoliteAdminKeyFile" gitolite-admin
 gitolitePrintCloneCmd "$gitoliteFluxKeyFile"  "$fluxNamespace"
-echo "ARGOCD_OPTS='--grpc-web' argocd login localhost:$ingressHttpsNodePort --insecure --username admin --password \"\$(kubectl -n $argoCdNamespace get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)\""
-
+echo "argocd login localhost:$argocdNodePort --insecure --username admin --password \"\$(kubectl -n $argoCdNamespace get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)\""
