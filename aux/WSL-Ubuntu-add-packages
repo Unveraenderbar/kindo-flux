@@ -1,0 +1,54 @@
+#!/bin/sh
+
+# The default distribution for Microsoft Windows Subsystem for Linux is
+# Ubuntu 18.04,
+# which does not contain podman as package in its standard repository set.
+# This script sets up a WSL Ubuntu instance to use the OpenSuse kubic repository
+# as a substitute.
+
+set -ex
+
+aptSourceRepo='devel:kubic:libcontainers:stable'
+aptSourceDesc="/etc/apt/sources.list.d/$aptSourceRepo.list"
+kubicRepoHost='download.opensuse.org/repositories'
+
+[ "$(id -u)" = '0' ] || sudo='sudo'
+[ -f "$aptSourceDesc" ] || {
+    $sudo apt-get update
+    $sudo apt-get install -qqy gnupg2 wget
+
+    # shellcheck disable=SC1091
+    . /etc/os-release # initialize Ubuntu distribution-specific variables like "VERSION_ID"
+    osFlavour="xUbuntu_${VERSION_ID}" # pkgs in SuSE repo are built for xUbuntu
+    mkdir -p /etc/apt/keyrings
+    wget -nv -O- "https://$kubicRepoHost/$aptSourceRepo/$osFlavour/Release.key" \
+        | $sudo apt-key add - # fetch key, add & trust kubic pkg repo...
+    echo "deb http://${kubicRepoHost}/$(echo $aptSourceRepo | sed 's#:#:/#g')/$osFlavour/ /" \
+        | $sudo sh -c "cat > $aptSourceDesc" # ... and add kubic pkg repo descriptor
+    $sudo apt-get update
+}
+
+# Pkgs after 1. line are for building podman from soureces (as fallback / in case latest version is needed)
+# (see https://podman.io/getting-started/installation):
+$sudo apt-get install -qqy podman skopeo buildah \
+    btrfs-progs \
+    git \
+    go-md2man \
+    iptables \
+    libapparmor-dev \
+    libassuan-dev \
+    libbtrfs-dev \
+    libc6-dev \
+    libdevmapper-dev \
+    libglib2.0-dev \
+    libgpgme-dev \
+    libgpg-error-dev \
+    libprotobuf-dev \
+    libprotobuf-c-dev \
+    libseccomp-dev \
+    libselinux1-dev \
+    libsystemd-dev \
+    make \
+    pkg-config \
+    runc \
+    uidmap

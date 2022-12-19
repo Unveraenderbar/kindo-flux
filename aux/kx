@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# shell functions for building / switching between k8s contexts while
+# no kubeconfig file has to be written to, and shell completion is updated
+# to reflect new context after the switch -- this works for bash+zsh
+# see
+# https://kubernetes.io/docs/concepts/configuration/organize-cluster-access-kubeconfig/#merging-kubeconfig-files
+# https://groups.google.com/g/kubernetes-sig-cli-feature-requests/c/yUUxIIx8i84/m/BHyC4G0kAQAJ
+
+alias k=kubectl
+
+# shellcheck disable=SC2120 # arg is optional and has default
+kcomplete() {
+    # shellcheck disable=SC1090
+    source <("${1:-kubectl}" completion "$(basename "${BASH}${ZSH_NAME}")");
+    # shellcheck disable=SC2091
+    [ -n "$BASH" ] && $(complete | sed -n 's/ kubectl$/ k/p') # zsh does this automatically
+}
+
+# shellcheck disable=SC2120 # arg is optional and has default
+kc() { kubectl config get-contexts "${1:-$(kubectl config current-context)}"; }
+
+kx() {
+    local kxDir="${XDG_CONFIG_HOME:-$HOME/.config/kubectx}"
+    local ctxFile="$kxDir/contexts/$1"
+    if [ -n "$1" ] && [ -r "$ctxFile" ]; then
+        __kxCtx() { echo "$kxDir/${1}s/$(yq '.contexts[].context.'"$1" "$ctxFile")"; }
+        KUBECONFIG="$ctxFile:$(__kxCtx user):$(__kxCtx cluster)"; export KUBECONFIG
+    else
+        ls "$kxDir/contexts"
+    fi
+    kcomplete
+    kc
+}
