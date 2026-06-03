@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # General kind-related parameters:
-k8sVersion="${KIND_K8s_VERSION:-v1.26.0}"
+k8sVersion="${KIND_K8s_VERSION:-v1.35.0}"
 kindImage="kindest/node:$k8sVersion"
 clusterName="${1:-k8s-$k8sVersion}"
 kindTmpDir="${TMPDIR:=/var/tmp}/$clusterName"
@@ -9,6 +9,10 @@ kindConfig="${2:-$kindTmpDir/kind-$k8sVersion.yaml}"
 kubeConfig="${3:-$kindTmpDir/kubeconfig-$clusterName}"
 kxDir="${XDG_CONFIG_HOME:-$HOME/.config}/kubectx"
 sshKeyScanCmd="${KIND_SSH_KEYSCAN_CMD=ssh-keyscan -t ecdsa -p}"
+
+# kubectl-related parameters:
+kubectlBaseUrl="https://dl.k8s.io/release"
+kubectlUrl="${KUBECTL_URL:-$kubectlBaseUrl/$(curl -Ls $kubectlBaseUrl/stable.txt)/bin/linux/amd64/kubectl}"
 
 # gitolite+OpenSSH image related parameters:
 opensshImg="${GITOSSH_BASE_IMAGE:-docker.io/linuxserver/openssh-server:latest}"
@@ -37,7 +41,7 @@ gitIsRepoUnchanged() {
 # FluxCD related parameters:
 fluxNamespace="${KIND_FLUX_NAMESPACE:-flux-system}"
 fluxBootNamespace="${KIND_FLUX_BOOT_NAMESPACE:-flux-bootstrap}"
-fluxVersion="${FLUX_VERSION:-0.37.0}"
+fluxVersion="${FLUX_VERSION:-2.8.8}"
 fluxUrl="https://github.com/fluxcd/flux2/releases/download/v$fluxVersion/flux_${fluxVersion}_linux_amd64.tar.gz"
 gitoliteFluxKeyFile="${GITOSSH_FLUX_KEY_FILE:-$kindTmpDir/$fluxNamespace.ecdsa}"
 gitoliteFluxPubKeyFile="$gitoliteAdminClone/keydir/$fluxNamespace.pub"
@@ -49,7 +53,56 @@ argoCdVersion="${ARGOCD_VERSION:-stable}"
 argoCdUrl="https://raw.githubusercontent.com/argoproj/argo-cd/$argoCdVersion/manifests/install.yaml"
 argocdNodePort="$((${ARGOCD_NODE_PORT:-${nodePortPrefix}0333} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
 
+# k8s cluster API  related parameters:
+clusterApiProviderNamespace="${CLUSTER_API_PROVIDER_NAMESPACE:-capi}"
+clusterApiTestNamespace="${CLUSTER_API_PROVIDER_NAMESPACE:-capv-test}"
 vclusterNodePort="$((${VCLUSTER_NODE_PORT:-${nodePortPrefix}0444} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
+clusterApiHelmValues='service:\n  type: NodePort'
+clusterApiEnvPatch="patches:
+- target:
+    kind: Deployment
+    name: .*
+  patch: |-
+    - op: add
+      path: '/spec/template/spec/containers/0/env/-'
+      value:
+        name: CLUSTER_NAME
+        value: '$clusterName'
+    - op: add
+      path: '/spec/template/spec/containers/0/env/-'
+      value:
+        name: CLUSTER_NAMESPACE
+        value: '$clusterApiProviderNamespace'
+    - op: add
+      path: '/spec/template/spec/containers/0/env/-'
+      value:
+        name: KUBERNETES_VERSION
+        value: '$k8sVersion'
+    - op: add
+      path: '/spec/template/spec/containers/0/env/-'
+      value:
+        name: HELM_VALUES
+        value: '$clusterApiHelmValues'
+- target:
+    kind: VCluster
+    name: $clusterApiTestNamespace
+  patch: |-
+    - op: replace
+      path: '/spec/helmRelease/chart/name'
+      value: ''
+    - op: replace
+      path: '/spec/helmRelease/chart/repo'
+      value: ''
+    - op: replace
+      path: '/spec/helmRelease/chart/version'
+      value: ''
+- target:
+    kind: Deployment
+    name: cluster-api-provider-vcluster-controller-manager
+  patch: |-
+    - op: replace
+      path: '/spec/template/spec/containers/1/image'
+      value: 'docker.io/kubebuilder/kube-rbac-proxy:v0.8.0' # default tries to pull from ghcr.io where the image is not available?"
 
 fluxWaitForKustomization() {
     kubeCtl() { kubectl -n "$fluxNamespace" "$@"; }
@@ -68,13 +121,13 @@ fluxAddComponent() {( # run in sub-shell to isolate git SSH command / working di
     componentSubDir="clusters/$clusterName/$1"
     mkdir -p "$fluxCloneDir/$componentSubDir"
     cd "$fluxCloneDir/$componentSubDir"
-    wget "-O$1-components.yaml" "$2"
+    eval "${7:-wget -O- \"$2\"}" > "$1-components.yaml"
     if ! gitIsRepoUnchanged; then
         git add .; git commit -m "Add $3 for kind manifests"; git push
     fi
 
     tee "$1-sync.yaml" <<-EOF
-	apiVersion: kustomize.toolkit.fluxcd.io/v1beta2
+	apiVersion: kustomize.toolkit.fluxcd.io/v1
 	kind: Kustomization
 	metadata:
 	  labels:
@@ -84,7 +137,7 @@ fluxAddComponent() {( # run in sub-shell to isolate git SSH command / working di
 	  namespace: $fluxNamespace
 	spec:
 	  force: false
-	  interval: 10m0s
+	  interval: 1m0s
 	  path: ./$componentSubDir
 	  prune: true
 	  sourceRef:
@@ -110,9 +163,25 @@ fluxAddComponent() {( # run in sub-shell to isolate git SSH command / working di
 )}
 
 ingressNamespace="${KIND_INGRESS_NAMESPACE:-ingress-nginx}"
-ingressUrl="${KIND_INGRESS_DEPLOYMENT_URL:-https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml}"
+ingressUrl="${KIND_INGRESS_DEPLOYMENT_URL:-https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.15.1/deploy/static/provider/cloud/deploy.yaml}"
 
 metricsServerUrl="${KIND_METRICS_SERVER_DEPLOYMENT_URL:-https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml}"
+
+envTrueCheck() {
+   [ "$(echo "$1" | tr '[:upper:]' '[:lower:]')" = 'true' ]
+}
+
+finishInfoExit() {
+    set +x 2>/dev/null
+    kubectl get pod -A
+    # shellcheck disable=SC2059
+    printf "\nexport KUBECONFIG='%s'\n" "$kubeConfig"
+    gitolitePrintCloneCmd "$gitoliteAdminKeyFile" gitolite-admin
+    envTrueCheck "$KINDOFLUX_ONLY_K8S" || gitolitePrintCloneCmd "$gitoliteFluxKeyFile"  "$fluxNamespace"
+    envTrueCheck "$KINDOFLUX_ARGO" \
+        && echo "argocd login localhost:$argocdNodePort --insecure --username admin --password \"\$(kubectl -n $argoCdNamespace get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)\""
+    exit "$1"
+}
 
 ## phase 0 prepare:
 
@@ -121,6 +190,7 @@ metricsServerUrl="${KIND_METRICS_SERVER_DEPLOYMENT_URL:-https://github.com/kuber
 inotifyMaxInstances="$(cat /proc/sys/fs/inotify/max_user_instances)"
 [ "$inotifyMaxInstances" -ge 512 ] || {
     echo "Cannot provision ArgoCD, max. count $inotifyMaxInstances of inotify user instances too low for ArgoCD"
+    echo "Run sudo sysctl sysctl fs.inotify.max_user_instances=8192 for correction"
     exit 1
 }
 
@@ -152,7 +222,9 @@ if [ -z "$(podman images --noheading "$gitosshImg")" ]; then # trigger rebuild o
             "apk update; apk upgrade; apk add ${GITOSSH_PKGS:-git perl gitolite}
              sed -i -e 's/ \(2222\)/ \${OPENSSH_PORT:-\1}/' /etc/s6-overlay/s6-rc.d/svc-openssh-server/run
              usermod -u $gitoliteUid -g $gitoliteGid $gitoliteUser
-             wget -O- $fluxUrl | tar -oxzf - -C /usr/local/bin flux"
+             wget -O- $fluxUrl | tar -oxzf - -C /usr/local/bin flux
+             wget -O    /usr/bin/kubectl $kubectlUrl
+             chmod 0555 /usr/bin/kubectl"
     buildah commit --rm "$gitosshName" "$gitosshImg"
 fi
 gitolitePwEntry="$(podman run --rm --entrypoint='' "$gitosshName" grep "^$gitoliteUser" /etc/passwd)"
@@ -169,14 +241,14 @@ tee "$kindConfig" <<-EOF
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: $clusterName
+networking:
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 6443 # prevents API server listening on random port
+  ipFamily: ipv4 # disables IPV6 networking
 nodes:
 - role: control-plane
-  kubeadmConfigPatches:
-  - |
-    kind: InitConfiguration
-    nodeRegistration:
-      kubeletExtraArgs:
-        node-labels: "ingress-ready=true"
+  labels:
+    ingress-ready: true
   extraPortMappings:
   - containerPort: 80
     hostPort: $ingressHttpNodePort
@@ -199,9 +271,9 @@ $sudo sh -exc "kind delete cluster --name $clusterName || true
                podman rm --filter name=$clusterName
                $kindCmd create cluster --image $kindImage --config $kindConfig
                $kindCmd export kubeconfig --kubeconfig=$kubeConfig --name $clusterName
-               chown $gitoliteUid.$gitoliteGid $kubeConfig
-               $kindCmd load image-archive $gitosshImgArchive --name=$clusterName $gitosshImg"
-if [ -d "$kxDir" ] && [ -d "$kxDir/clusters" ] && [ -d "$kxDir/users" ] && command -v yq; then
+               chown $gitoliteUid:$gitoliteGid $kubeConfig
+               $kindCmd load image-archive $gitosshImgArchive --name=$clusterName"
+if [ -d "$kxDir" ] && [ -d "$kxDir/clusters" ] && [ -d "$kxDir/users" ] && command -v yq >/dev/null; then
    kubeClusters="$(yq 'with_entries(select(.key == "clusters"))' "$kubeConfig")"
       kubeUsers="$(yq 'with_entries(select(.key == "users"   ))' "$kubeConfig")"
    echo "$kubeClusters" > "$kxDir/clusters/$(echo "$kubeClusters" | yq '.clusters[].name' -)"
@@ -316,6 +388,7 @@ EOF
 
 ## phase 2.2 connect git service to container host:
 
+sleep 2 # give gitolite pod time to show up, so that it can be waited for
 kubectl -n "$gitoliteNamespace" wait --for=condition=ready --timeout="${KIND_KUSTOMIZATION_WAIT_TIMEOUT:-4m}" \
         pod -l "app=$gitoliteNamespace"
 if [ -r "$knownHostsFile" ] && [ -s "$knownHostsFile" ]; then
@@ -334,6 +407,9 @@ kubectl -n "$gitoliteNamespace" create secret generic "$gitoliteNamespace" \
                                                       "--from-literal=known_hosts=$k8sServerPubKey" \
                                                       "--from-literal=clone_command=$gitoliteCloneCmd"
 
+status=$?
+envTrueCheck "$KINDOFLUX_ONLY_K8S" && finishInfoExit $status
+
 ## phase 2.3 instantiate FluxCD base git repository:
 
 rm -rf "$gitoliteAdminClone" "$gitoliteFluxKeyFile" "$gitoliteFluxPubKeyFile"
@@ -344,7 +420,7 @@ rm -rf "$gitoliteAdminClone" "$gitoliteFluxKeyFile" "$gitoliteFluxPubKeyFile"
     if ! grep -q "^repo $fluxNamespace" "$gitoliteConfFile"; then # flux bootstrap expects 'flux-system' repo
         printf "\nrepo %s\n    RW+     =   %s\n" "$fluxNamespace" "$fluxNamespace" >> "$gitoliteConfFile"
     fi
-    if [ ! -r "$gitoliteFluxKeyFile" ] || [ ! -r "$gitoliteFluxPubKeyFile" ] ; then
+    if gitIsRepoUnchanged; then
         ssh-keygen -qt ed25519 -a 64 -P '' -C "$fluxNamespace" -f "$gitoliteFluxKeyFile"
         mv "$gitoliteFluxKeyFile.pub" "$gitoliteFluxPubKeyFile"
     fi
@@ -392,7 +468,7 @@ spec:
     - '--timeout=${FLUX_BOOTSTRAP_TIMEOUT:-12m}'
     - '--url=ssh://git@$k8sSshSvcName:$opensshPort/$fluxNamespace'
     # flux aborts w/o error message if started w/o silent option!
-    command: ['flux', 'bootstrap', 'git', '--silent', '--branch', 'master']
+    command: ['flux', 'bootstrap', 'git', '--silent', '--branch', 'master', '--interval', '1m']
     image: $gitosshImg
     imagePullPolicy: Never
     name: $fluxBootNamespace
@@ -420,19 +496,41 @@ kubectl -n "$fluxNamespace" patch secret "$fluxNamespace" --type json \
 
 fluxAddComponent "$ingressNamespace" "$ingressUrl" 'NGINX Ingress' "$ingressNamespace" \
                  'app.kubernetes.io/component=controller,app.kubernetes.io/instance=ingress-nginx' \
-					'patchesJSON6902:
+					'patches:
 					- target:
 					    kind: ConfigMap
 					    name: ingress-nginx-controller
 					  patch: |-
 					    - op: add
-					      path: "/data/worker-processes"
-					      value: "2"'
+					      path: "/data"
+					      value:
+					        "worker-processes": "2"
+					- target:
+					    kind: Deployment
+					    name: ingress-nginx-controller
+					  patch: |-
+					    - op: add
+					      path: "/spec/template/spec/containers/0/args/-"
+					      value:
+					        "-v=3"
+					- target:
+					    kind: (Deployment|Job)
+					    name: ingress-nginx-.*
+					  patch: |-
+					    - op: add
+					      path: "/spec/template/spec/nodeSelector/ingress-ready"
+					      value: "true"
+					    - op: add
+					      path: "/spec/template/spec/tolerations"
+					      value:
+					        - key: node-role.kubernetes.io/control-plane
+					          operator: Exists
+					          effect: NoSchedule'
 
 ## phase 3.2 provision k8s metrics server via FluxCD kustomization:
 
 fluxAddComponent metrics-server "$metricsServerUrl" 'Metrics Server' kube-system k8s-app=metrics-server \
-					'patchesJSON6902:
+					'patches:
 					- target:
 					    kind: Deployment
 					    name: metrics-server
@@ -441,13 +539,14 @@ fluxAddComponent metrics-server "$metricsServerUrl" 'Metrics Server' kube-system
 					      path: "/spec/template/spec/containers/0/args/-"
 					      value: "--kubelet-insecure-tls"'
 
-## phase 3.3 provision ArgoCD GitOps toolkit via FluxCD kustomization:
-kubectl create ns "$argoCdNamespace"
-fluxAddComponent argocd "$argoCdUrl" 'ArgoCD GitOps toolkit' "$argoCdNamespace" 'partOf=ArgoCD' \
+## phase 3.3 optionally, provision ArgoCD GitOps toolkit via FluxCD kustomization:
+if envTrueCheck "$KINDOFLUX_ARGO"; then
+    kubectl create ns "$argoCdNamespace"
+    fluxAddComponent argocd "$argoCdUrl" 'ArgoCD GitOps toolkit' "$argoCdNamespace" 'partOf=ArgoCD' \
 					"commonLabels:
 					  partOf: ArgoCD
 					namespace: $argoCdNamespace # ArgoCD resources are not namespaced...
-					patchesJSON6902:
+					patches:
 					- target:
 					    kind: Kustomization
 					    name: argocd
@@ -465,18 +564,23 @@ fluxAddComponent argocd "$argoCdUrl" 'ArgoCD GitOps toolkit' "$argoCdNamespace" 
 					    - op: add
 					      path: '/spec/ports/1/nodePort'
 					      value: $argocdNodePort"
+fi
+
+## phase 3.4 optionally, provision k8s-in-k8s via cluster API with vcluster provider (does not work due to VCluster 0.34.0 inconsistencies with kube-rbac-proxy):
+if envTrueCheck "$KINDOFLUX_CLUSTERAPI"; then
+    kubectl create ns "$clusterApiProviderNamespace"
+    clusterctl init -v 10 --infrastructure vcluster --target-namespace "$clusterApiProviderNamespace" --wait-providers
+    kubectl create ns "$clusterApiTestNamespace"
+    fluxAddComponent "$clusterApiTestNamespace" '' 'k8s Cluster API' "$clusterApiTestNamespace" "partOf=$clusterApiTestNamespace" \
+                     "$clusterApiEnvPatch" \
+                     "export CLUSTER_NAME=$clusterName CLUSTER_NAMESPACE=$clusterApiProviderNamespace KUBERNETES_VERSION=$k8sVersion HELM_VALUES='$clusterApiHelmValues';
+                      clusterctl generate cluster $clusterApiTestNamespace --target-namespace $clusterApiProviderNamespace --kubernetes-version $k8sVersion --control-plane-machine-count=1 --worker-machine-count=2 "
+fi
 
 ## phase 4 clean up, show k8s pod status and print some useful commands for
 #          interaction w/ cluster / FluxCD via gitolite / argocd CLI, using
 #          the current parametrization:
 
-kubectl -n "$ingressNamespace" delete job ingress-nginx-admission-create ingress-nginx-admission-patch 
 rm -rf "$kindConfig" "$gitosshImgArchive" "$gitoliteAdminKeyFile.pub" "$gitoliteAdminClone" "$fluxCloneDir"
-set +x
 
-kubectl get pod -A
-# shellcheck disable=SC2059
-printf "\nexport KUBECONFIG='%s'\n" "$kubeConfig"
-gitolitePrintCloneCmd "$gitoliteAdminKeyFile" gitolite-admin
-gitolitePrintCloneCmd "$gitoliteFluxKeyFile"  "$fluxNamespace"
-echo "argocd login localhost:$argocdNodePort --insecure --username admin --password \"\$(kubectl -n $argoCdNamespace get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)\""
+finishInfoExit $?
