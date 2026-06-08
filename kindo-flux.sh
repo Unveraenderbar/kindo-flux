@@ -167,6 +167,11 @@ ingressUrl="${KIND_INGRESS_DEPLOYMENT_URL:-https://raw.githubusercontent.com/kub
 
 metricsServerUrl="${KIND_METRICS_SERVER_DEPLOYMENT_URL:-https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml}"
 
+export HELM_CACHE_HOME="$kindTmpDir/.cache/helm" HELM_CONFIG_HOME="$kindTmpDir/.config/helm"
+zotChartUrl="${ZOT_HELM_CHART_URL:-http://zotregistry.dev/helm-charts}"
+zotNamespace="${ZOT_NAMESPACE:-zot}"
+zotNodePort="$((${ZOT_NODE_PORT:-${nodePortPrefix}0555} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
+
 envTrueCheck() {
    [ "$(echo "$1" | tr '[:upper:]' '[:lower:]')" = 'true' ]
 }
@@ -264,6 +269,9 @@ nodes:
     protocol: TCP
   - containerPort: $vclusterNodePort
     hostPort: $vclusterNodePort
+    protocol: TCP
+  - containerPort: $zotNodePort
+    hostPort: $zotNodePort
     protocol: TCP
 $(seq 1 "${KIND_NUM_NODES:-2}" | xargs -rn1 sh -c "printf -- \"- role: worker\n\"")
 EOF
@@ -407,10 +415,20 @@ kubectl -n "$gitoliteNamespace" create secret generic "$gitoliteNamespace" \
                                                       "--from-literal=known_hosts=$k8sServerPubKey" \
                                                       "--from-literal=clone_command=$gitoliteCloneCmd"
 
+## phase 2.3 provision OCI registry (independent from Flux, so we can practice gitless GitOps)
+kubectl create namespace "$zotNamespace"
+helm repo add project-zot "$zotChartUrl"
+helm install -n "$zotNamespace" zot project-zot/zot \
+             --set 'persistence=true' --set 'pvc.storage=20Gi' --set 'pvc.storageClassName=standard' \
+             --set "service.nodePort=$zotNodePort" --set 'mountConfig=true'
+sleep 2 # give zot workload time to show up, so that it can be waited for
+kubectl -n "$zotNamespace" wait --for=condition=ready --timeout="${KIND_KUSTOMIZATION_WAIT_TIMEOUT:-4m}" \
+        pod -l "app.kubernetes.io/name=zot"
+
 status=$?
 envTrueCheck "$KINDOFLUX_ONLY_K8S" && finishInfoExit $status
 
-## phase 2.3 instantiate FluxCD base git repository:
+## phase 2.4 instantiate FluxCD base git repository:
 
 rm -rf "$gitoliteAdminClone" "$gitoliteFluxKeyFile" "$gitoliteFluxPubKeyFile"
 # shellcheck disable=SC2030,SC2031
@@ -430,7 +448,7 @@ rm -rf "$gitoliteAdminClone" "$gitoliteFluxKeyFile" "$gitoliteFluxPubKeyFile"
         git push
     fi)
 
-## phase 2.4 bootstrap FluxCD controllers and initial kustomization:
+## phase 2.5 bootstrap FluxCD controllers and initial kustomization:
 
 kubectl create namespace "$fluxBootNamespace"
 kubectl -n "$fluxBootNamespace" create secret generic "$fluxNamespace" \
