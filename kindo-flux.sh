@@ -235,8 +235,8 @@ podman save "$gitosshImg" > "$gitosshImgArchive"
 ## phase 1.2 provision k8s / kind cluster w/ port-forwarding for ingress:
 
 export KUBECONFIG="$kubeConfig" # kind tries to lock kubectl configuration
-ingressHttpNodePort="${unprivilegedPort:+80}$((80  + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
-ingressHttpsNodePort="${unprivilegedPort:+8}$((443 + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
+ingressHttpNodePort="${unprivilegedPort:+300}$((80  + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
+ingressHttpsNodePort="${unprivilegedPort:+30}$((443 + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
 tee "$kindConfig" <<-EOF
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -511,8 +511,10 @@ fluxAddComponent "$ingressNamespace" "$ingressUrl" 'NGINX Ingress' "$ingressName
 					  patch: |-
 					    - op: add
 					      path: "/spec/template/spec/containers/0/args/-"
-					      value:
-					        "-v=3"
+					      value: "--watch-ingress-without-class=true"
+					    - op: add
+					      path: "/spec/template/spec/containers/0/args/-"
+					      value: "-v='"${KIND_INGRESS_NGINX_DEBUG_LEVEL:-1}"'"
 					- target:
 					    kind: (Deployment|Job)
 					    name: ingress-nginx-.*
@@ -525,7 +527,23 @@ fluxAddComponent "$ingressNamespace" "$ingressUrl" 'NGINX Ingress' "$ingressName
 					      value:
 					        - key: node-role.kubernetes.io/control-plane
 					          operator: Exists
-					          effect: NoSchedule'
+					          effect: NoSchedule
+					- target:
+					    kind: Service
+					    name: ingress-nginx-controller
+					  patch: |-
+					    - op: replace
+					      path: /spec/externalTrafficPolicy
+					      value: Cluster
+					    - op: replace
+					      path: /spec/type
+					      value: NodePort
+					    - op: replace
+					      path: /spec/ports/0/nodePort
+					      value: '"$ingressHttpNodePort"'
+					    - op: replace
+					      path: /spec/ports/1/nodePort
+					      value: '"$ingressHttpsNodePort"
 
 ## phase 3.2 provision k8s metrics server via FluxCD kustomization:
 
