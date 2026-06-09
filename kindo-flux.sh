@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # General kind-related parameters:
-k8sVersion="${KIND_K8s_VERSION:-v1.35.0}"
+k8sVersion="${KIND_K8s_VERSION:-v1.36.1}"
 kindImage="kindest/node:$k8sVersion"
 clusterName="${1:-k8s-$k8sVersion}"
 kindTmpDir="${TMPDIR:=/var/tmp}/$clusterName"
