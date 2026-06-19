@@ -162,8 +162,7 @@ fluxAddComponent() {( # run in sub-shell to isolate git SSH command / working di
     kubectl -n "$4" wait pod -l "$5" --for=condition=ready --timeout="${K8S_POD_WAIT_TIMEOUT:-6m}"
 )}
 
-ingressNamespace="${KIND_INGRESS_NAMESPACE:-ingress-nginx}"
-ingressUrl="${KIND_INGRESS_DEPLOYMENT_URL:-https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.15.1/deploy/static/provider/cloud/deploy.yaml}"
+contourNamespace="${KIND_CONTOUR_NAMESPACE:-contour}"
 
 metricsServerUrl="${KIND_METRICS_SERVER_DEPLOYMENT_URL:-https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml}"
 
@@ -194,8 +193,12 @@ finishInfoExit() {
 # documentation hub:
 inotifyMaxInstances="$(cat /proc/sys/fs/inotify/max_user_instances)"
 [ "$inotifyMaxInstances" -ge 512 ] || {
-    echo "Cannot provision ArgoCD, max. count $inotifyMaxInstances of inotify user instances too low for ArgoCD"
-    echo "Run sudo sysctl sysctl fs.inotify.max_user_instances=8192 for correction"
+    echo "Cannot provision ArgoCD, max. count $inotifyMaxInstances of inotify user instances too low for ArgoCD" 1>&2
+    echo "Run sudo sysctl sysctl fs.inotify.max_user_instances=8192 for correction" 1>&2
+    exit 1
+}
+lsmod | awk '$1 == "ip_tables" {exit 0}' || {
+    echo "Cannot provision Contour ingress controllers as IP tables kernel module not loaded, aborting" 1>&2
     exit 1
 }
 
@@ -237,7 +240,7 @@ gitoliteHomeDir="$(echo "$gitolitePwEntry" | cut -d: -f 6)"
 gitosshImgArchive="$kindTmpDir/$(echo "$gitosshImg" | tr /: --)"
 podman save "$gitosshImg" > "$gitosshImgArchive"
 
-## phase 1.2 provision k8s / kind cluster w/ port-forwarding for ingress:
+## phase 1.2 provision k8s / kind cluster w/ port-forwarding for ingress:and SSH based services
 
 export KUBECONFIG="$kubeConfig" # kind tries to lock kubectl configuration
 ingressHttpNodePort="${unprivilegedPort:+300}$((80  + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
@@ -257,9 +260,11 @@ nodes:
   extraPortMappings:
   - containerPort: 80
     hostPort: $ingressHttpNodePort
+    listenAddress: 0.0.0.0
     protocol: TCP
   - containerPort: 443
     hostPort: $ingressHttpsNodePort
+    listenAddress: 0.0.0.0
     protocol: TCP
   - containerPort: $opensshNodePort
     hostPort: $opensshNodePort
@@ -415,7 +420,19 @@ kubectl -n "$gitoliteNamespace" create secret generic "$gitoliteNamespace" \
                                                       "--from-literal=known_hosts=$k8sServerPubKey" \
                                                       "--from-literal=clone_command=$gitoliteCloneCmd"
 
-## phase 2.3 provision OCI registry (independent from Flux, so we can practice gitless GitOps)
+## phase 2.3 provision Contour ingress via Helm (i.e. independant of Flux in case we want to bootstrap the latter via operator)
+helm repo add contour https://projectcontour.github.io/helm-charts/
+helm repo update
+contourSelector='{"ingress-ready": "true"}'
+contourTolerations='[{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]'
+helm install --wait "$contourNamespace" contour/contour \
+             --create-namespace -n "$contourNamespace" --set "namespaceOverride=$contourNamespace" \
+             --set 'envoy.kind=deployment' --set 'contour.replicaCount=1' \
+             --set-json "contour.nodeSelector=$contourSelector"  --set-json "envoy.nodeSelector=$contourSelector" \
+             --set-json "contour.tolerations=$contourTolerations" --set-json "envoy.tolerations=$contourTolerations" \
+             --set-json 'envoy.useHostPort={"http": "true", "https": "true", "metrics": "true"}'
+
+## phase 2.4 provision OCI registry (independent from Flux, so we can practice gitless GitOps)
 kubectl create namespace "$zotNamespace"
 helm repo add project-zot "$zotChartUrl"
 helm install -n "$zotNamespace" zot project-zot/zot \
@@ -428,7 +445,7 @@ kubectl -n "$zotNamespace" wait --for=condition=ready --timeout="${KIND_KUSTOMIZ
 status=$?
 envTrueCheck "$KINDOFLUX_ONLY_K8S" && finishInfoExit $status
 
-## phase 2.4 instantiate FluxCD base git repository:
+## phase 2.5 instantiate FluxCD base git repository:
 
 rm -rf "$gitoliteAdminClone" "$gitoliteFluxKeyFile" "$gitoliteFluxPubKeyFile"
 # shellcheck disable=SC2030,SC2031
@@ -448,7 +465,7 @@ rm -rf "$gitoliteAdminClone" "$gitoliteFluxKeyFile" "$gitoliteFluxPubKeyFile"
         git push
     fi)
 
-## phase 2.5 bootstrap FluxCD controllers and initial kustomization:
+## phase 2.6 bootstrap FluxCD controllers and initial kustomization:
 
 kubectl create namespace "$fluxBootNamespace"
 kubectl -n "$fluxBootNamespace" create secret generic "$fluxNamespace" \
@@ -509,61 +526,7 @@ fluxCloneCmd="$(gitolitePrintCloneCmd "$gitoliteFluxKeyFile" "$fluxNamespace" | 
 kubectl -n "$fluxNamespace" patch secret "$fluxNamespace" --type json \
         -p '[{"op": "add", "path": "/data/clone_command", "value": "'"$fluxCloneCmd"'"}]'
 
-
-## phase 3.1 provision NGINX ingress via FluxCD kustomization:
-
-fluxAddComponent "$ingressNamespace" "$ingressUrl" 'NGINX Ingress' "$ingressNamespace" \
-                 'app.kubernetes.io/component=controller,app.kubernetes.io/instance=ingress-nginx' \
-					'patches:
-					- target:
-					    kind: ConfigMap
-					    name: ingress-nginx-controller
-					  patch: |-
-					    - op: add
-					      path: "/data"
-					      value:
-					        "worker-processes": "2"
-					- target:
-					    kind: Deployment
-					    name: ingress-nginx-controller
-					  patch: |-
-					    - op: add
-					      path: "/spec/template/spec/containers/0/args/-"
-					      value: "--watch-ingress-without-class=true"
-					    - op: add
-					      path: "/spec/template/spec/containers/0/args/-"
-					      value: "-v='"${KIND_INGRESS_NGINX_DEBUG_LEVEL:-1}"'"
-					- target:
-					    kind: (Deployment|Job)
-					    name: ingress-nginx-.*
-					  patch: |-
-					    - op: add
-					      path: "/spec/template/spec/nodeSelector/ingress-ready"
-					      value: "true"
-					    - op: add
-					      path: "/spec/template/spec/tolerations"
-					      value:
-					        - key: node-role.kubernetes.io/control-plane
-					          operator: Exists
-					          effect: NoSchedule
-					- target:
-					    kind: Service
-					    name: ingress-nginx-controller
-					  patch: |-
-					    - op: replace
-					      path: /spec/externalTrafficPolicy
-					      value: Cluster
-					    - op: replace
-					      path: /spec/type
-					      value: NodePort
-					    - op: replace
-					      path: /spec/ports/0/nodePort
-					      value: '"$ingressHttpNodePort"'
-					    - op: replace
-					      path: /spec/ports/1/nodePort
-					      value: '"$ingressHttpsNodePort"
-
-## phase 3.2 provision k8s metrics server via FluxCD kustomization:
+## phase 3.1 provision k8s metrics server via FluxCD kustomization:
 
 fluxAddComponent metrics-server "$metricsServerUrl" 'Metrics Server' kube-system k8s-app=metrics-server \
 					'patches:
@@ -575,7 +538,7 @@ fluxAddComponent metrics-server "$metricsServerUrl" 'Metrics Server' kube-system
 					      path: "/spec/template/spec/containers/0/args/-"
 					      value: "--kubelet-insecure-tls"'
 
-## phase 3.3 optionally, provision ArgoCD GitOps toolkit via FluxCD kustomization:
+## phase 3.2 optionally, provision ArgoCD GitOps toolkit via FluxCD kustomization:
 if envTrueCheck "$KINDOFLUX_ARGO"; then
     kubectl create ns "$argoCdNamespace"
     fluxAddComponent argocd "$argoCdUrl" 'ArgoCD GitOps toolkit' "$argoCdNamespace" 'partOf=ArgoCD' \
@@ -602,7 +565,7 @@ if envTrueCheck "$KINDOFLUX_ARGO"; then
 					      value: $argocdNodePort"
 fi
 
-## phase 3.4 optionally, provision k8s-in-k8s via cluster API with vcluster provider (does not work due to VCluster 0.34.0 inconsistencies with kube-rbac-proxy):
+## phase 3.3 optionally, provision k8s-in-k8s via cluster API with vcluster provider (does not work due to VCluster 0.34.0 inconsistencies with kube-rbac-proxy):
 if envTrueCheck "$KINDOFLUX_CLUSTERAPI"; then
     kubectl create ns "$clusterApiProviderNamespace"
     clusterctl init -v 10 --infrastructure vcluster --target-namespace "$clusterApiProviderNamespace" --wait-providers
