@@ -169,7 +169,6 @@ metricsServerUrl="${KIND_METRICS_SERVER_DEPLOYMENT_URL:-https://github.com/kuber
 export HELM_CACHE_HOME="$kindTmpDir/.cache/helm" HELM_CONFIG_HOME="$kindTmpDir/.config/helm"
 zotChartUrl="${ZOT_HELM_CHART_URL:-http://zotregistry.dev/helm-charts}"
 zotNamespace="${ZOT_NAMESPACE:-zot}"
-zotNodePort="$((${ZOT_NODE_PORT:-${nodePortPrefix}0555} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
 
 envTrueCheck() {
    [ "$(echo "$1" | tr '[:upper:]' '[:lower:]')" = 'true' ]
@@ -227,7 +226,7 @@ if [ -z "$(podman images --noheading "$gitosshImg")" ]; then # trigger rebuild o
     ${TZ:+buildah config --env TZ="$TZ" "$gitosshName"}
     # have to make port in sshd configuration runtime-parametrizable in case we install w/ offset!
     buildah run "$gitosshName" sh -exc \
-            "apk update; apk upgrade; apk add ${GITOSSH_PKGS:-git perl gitolite}
+            "apk update; apk upgrade; apk add ${GITOSSH_PKGS:-git perl gitolite openssl}
              sed -i -e 's/ \(2222\)/ \${OPENSSH_PORT:-\1}/' /etc/s6-overlay/s6-rc.d/svc-openssh-server/run
              usermod -u $gitoliteUid -g $gitoliteGid $gitoliteUser
              wget -O- $fluxUrl | tar -oxzf - -C /usr/local/bin flux
@@ -274,9 +273,6 @@ nodes:
     protocol: TCP
   - containerPort: $vclusterNodePort
     hostPort: $vclusterNodePort
-    protocol: TCP
-  - containerPort: $zotNodePort
-    hostPort: $zotNodePort
     protocol: TCP
 $(seq 1 "${KIND_NUM_NODES:-2}" | xargs -rn1 sh -c "printf -- \"- role: worker\n\"")
 EOF
@@ -425,7 +421,7 @@ helm repo add contour https://projectcontour.github.io/helm-charts/
 helm repo update
 contourSelector='{"ingress-ready": "true"}'
 contourTolerations='[{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]'
-helm install --wait "$contourNamespace" contour/contour \
+helm install --wait "$contourNamespace" contour/contour --timeout '10m' \
              --create-namespace -n "$contourNamespace" --set "namespaceOverride=$contourNamespace" \
              --set 'envoy.kind=deployment' --set 'contour.replicaCount=1' \
              --set-json "contour.nodeSelector=$contourSelector"  --set-json "envoy.nodeSelector=$contourSelector" \
@@ -434,10 +430,20 @@ helm install --wait "$contourNamespace" contour/contour \
 
 ## phase 2.4 provision OCI registry (independent from Flux, so we can practice gitless GitOps)
 kubectl create namespace "$zotNamespace"
+gitolitePod="$(kubectl get pod -n "$gitoliteNamespace" -l "app=gitolite" -o name)"
+kubectl exec -n gitolite "$gitolitePod" -i -- \
+        sh -c 'cd /tmp && openssl req -quiet -x509 -nodes -days 365 -newkey rsa:2048 -keyout zot.key -out zot.crt \
+                                      -subj "/CN=site.local" -addext "subjectAltName=DNS:site.local"'
+(cd "$kindTmpDir"
+ kubectl exec -n "$gitoliteNamespace" "$gitolitePod" -i -- cat /tmp/zot.crt > zot.crt
+ kubectl exec -n "$gitoliteNamespace" "$gitolitePod" -i -- cat /tmp/zot.key > zot.key
+ kubectl create -n "$zotNamespace" secret tls zot-tls --cert=zot.crt --key=zot.key)
 helm repo add project-zot "$zotChartUrl"
 helm install -n "$zotNamespace" zot project-zot/zot \
              --set 'persistence=true' --set 'pvc.storage=20Gi' --set 'pvc.storageClassName=standard' \
-             --set "service.nodePort=$zotNodePort" --set 'mountConfig=true'
+             --set 'ingress.enabled=true' --set 'ingress.className=contour' \
+             --set-json 'ingress.hosts=[{"host": "site.local", "paths": [{"path": "/"}]}]' \
+             --set-json 'ingress.tls=[{"secretName": "zot-tls", "hosts": ["site.local"]}]'
 sleep 2 # give zot workload time to show up, so that it can be waited for
 kubectl -n "$zotNamespace" wait --for=condition=ready --timeout="${KIND_KUSTOMIZATION_WAIT_TIMEOUT:-4m}" \
         pod -l "app.kubernetes.io/name=zot"
