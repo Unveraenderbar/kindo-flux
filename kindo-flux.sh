@@ -4,9 +4,9 @@
 k8sVersion="${KIND_K8s_VERSION:-v1.36.1}"
 kindImage="kindest/node:$k8sVersion"
 clusterName="${1:-k8s-$k8sVersion}"
-kindTmpDir="${TMPDIR:=/var/tmp}/$clusterName"
-kindConfig="${2:-$kindTmpDir/kind-$k8sVersion.yaml}"
-kubeConfig="${3:-$kindTmpDir/kubeconfig-$clusterName}"
+export KIND_TMP_DIR="${TMPDIR:=/var/tmp}/$clusterName"
+kindConfig="${2:-$KIND_TMP_DIR/kind-$k8sVersion.yaml}"
+kubeConfig="${3:-$KIND_TMP_DIR/kubeconfig-$clusterName}"
 kxDir="${XDG_CONFIG_HOME:-$HOME/.config}/kubectx"
 sshKeyScanCmd="${KIND_SSH_KEYSCAN_CMD=ssh-keyscan -t ecdsa -p}"
 
@@ -24,8 +24,8 @@ gitoliteNamespace="${KIND_GITOLITE_NAMESPACE:-gitolite}"
 gitosshName="${GITOSSH_IMAGE_NAME:-${GITOSSH_NAME:-docker.io/library/gitossh}}"
 gitosshImg="$gitosshName:${GITOSSH_TAG:-latest}"
 gitoliteUser="${GITOLITE_USERNAME:-git}"
-gitoliteAdminKeyFile="${GITOSSH_ADMIN_KEY_FILE:-$kindTmpDir/gitolite.ecdsa}"
-gitoliteAdminClone="${GITOLITE_ADMIN_CLONE:-$kindTmpDir/gitolite-admin}"
+gitoliteAdminKeyFile="${GITOSSH_ADMIN_KEY_FILE:-$KIND_TMP_DIR/gitolite.ecdsa}"
+gitoliteAdminClone="${GITOLITE_ADMIN_CLONE:-$KIND_TMP_DIR/gitolite-admin}"
 gitoliteConfFile="$gitoliteAdminClone/conf/gitolite.conf"
 gitoliteLocalBaseUrl="ssh://$gitoliteUser@localhost:$opensshNodePort"
 gitoliteSSHCmd='ssh -o IdentityAgent=none -F /dev/null -i'
@@ -43,9 +43,9 @@ fluxNamespace="${KIND_FLUX_NAMESPACE:-flux-system}"
 fluxBootNamespace="${KIND_FLUX_BOOT_NAMESPACE:-flux-bootstrap}"
 fluxVersion="${FLUX_VERSION:-2.8.8}"
 fluxUrl="https://github.com/fluxcd/flux2/releases/download/v$fluxVersion/flux_${fluxVersion}_linux_amd64.tar.gz"
-gitoliteFluxKeyFile="${GITOSSH_FLUX_KEY_FILE:-$kindTmpDir/$fluxNamespace.ecdsa}"
+gitoliteFluxKeyFile="${GITOSSH_FLUX_KEY_FILE:-$KIND_TMP_DIR/$fluxNamespace.ecdsa}"
 gitoliteFluxPubKeyFile="$gitoliteAdminClone/keydir/$fluxNamespace.pub"
-fluxCloneDir="${KIND_FLUX_CLONE_DIR:-$kindTmpDir/$fluxNamespace}"
+fluxCloneDir="${KIND_FLUX_CLONE_DIR:-$KIND_TMP_DIR/$fluxNamespace}"
 
 # ArgoCD related parameters:
 argoCdNamespace="${KIND_FLUX_NAMESPACE:-argocd}"
@@ -162,11 +162,12 @@ fluxAddComponent() {( # run in sub-shell to isolate git SSH command / working di
     kubectl -n "$4" wait pod -l "$5" --for=condition=ready --timeout="${K8S_POD_WAIT_TIMEOUT:-6m}"
 )}
 
-contourNamespace="${KIND_CONTOUR_NAMESPACE:-contour}"
+istioNamespace="${KIND_CONTOUR_NAMESPACE:-istio-system}"
+istioIngressGateway='ingress-gateway'
 
 metricsServerUrl="${KIND_METRICS_SERVER_DEPLOYMENT_URL:-https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml}"
 
-export HELM_CACHE_HOME="$kindTmpDir/.cache/helm" HELM_CONFIG_HOME="$kindTmpDir/.config/helm"
+export HELM_CACHE_HOME="$KIND_TMP_DIR/.cache/helm" HELM_CONFIG_HOME="$KIND_TMP_DIR/.config/helm"
 zotChartUrl="${ZOT_HELM_CHART_URL:-http://zotregistry.dev/helm-charts}"
 zotNamespace="${ZOT_NAMESPACE:-zot}"
 
@@ -183,6 +184,7 @@ finishInfoExit() {
     envTrueCheck "$KINDOFLUX_ONLY_K8S" || gitolitePrintCloneCmd "$gitoliteFluxKeyFile"  "$fluxNamespace"
     envTrueCheck "$KINDOFLUX_ARGO" \
         && echo "argocd login localhost:$argocdNodePort --insecure --username admin --password \"\$(kubectl -n $argoCdNamespace get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)\""
+    echo "export KIND_TMP_DIR=$KIND_TMP_DIR"
     exit "$1"
 }
 
@@ -212,7 +214,7 @@ else
     unprivilegedPort='true' # running rootless, cannot expose privileged ports
 fi
 
-rm -rf "$kindTmpDir"; (umask 077; mkdir -p "$kindTmpDir")
+rm -rf "$KIND_TMP_DIR"; (umask 077; mkdir -p "$KIND_TMP_DIR")
 
 gitoliteUid="$(id -u)"
 gitoliteGid="$(id -g)"
@@ -236,7 +238,7 @@ if [ -z "$(podman images --noheading "$gitosshImg")" ]; then # trigger rebuild o
 fi
 gitolitePwEntry="$(podman run --rm --entrypoint='' "$gitosshName" grep "^$gitoliteUser" /etc/passwd)"
 gitoliteHomeDir="$(echo "$gitolitePwEntry" | cut -d: -f 6)"
-gitosshImgArchive="$kindTmpDir/$(echo "$gitosshImg" | tr /: --)"
+gitosshImgArchive="$KIND_TMP_DIR/$(echo "$gitosshImg" | tr /: --)"
 podman save "$gitosshImg" > "$gitosshImgArchive"
 
 ## phase 1.2 provision k8s / kind cluster w/ port-forwarding for ingress:and SSH based services
@@ -257,13 +259,17 @@ nodes:
   labels:
     ingress-ready: true
   extraPortMappings:
-  - containerPort: 80
+  - containerPort: $ingressHttpNodePort
     hostPort: $ingressHttpNodePort
-    listenAddress: 0.0.0.0
+    listenAddress: '0.0.0.0'
     protocol: TCP
-  - containerPort: 443
+  - containerPort: $ingressHttpsNodePort
     hostPort: $ingressHttpsNodePort
-    listenAddress: 0.0.0.0
+    listenAddress: '0.0.0.0'
+    protocol: TCP
+  - containerPort: 15021
+    hostPort: 30081
+    listenAddress: '0.0.0.0'
     protocol: TCP
   - containerPort: $opensshNodePort
     hostPort: $opensshNodePort
@@ -416,37 +422,137 @@ kubectl -n "$gitoliteNamespace" create secret generic "$gitoliteNamespace" \
                                                       "--from-literal=known_hosts=$k8sServerPubKey" \
                                                       "--from-literal=clone_command=$gitoliteCloneCmd"
 
-## phase 2.3 provision Contour ingress via Helm (i.e. independant of Flux in case we want to bootstrap the latter via operator)
-helm repo add contour https://projectcontour.github.io/helm-charts/
-helm repo update
-contourSelector='{"ingress-ready": "true"}'
-contourTolerations='[{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]'
-helm install --wait "$contourNamespace" contour/contour --timeout '10m' \
-             --create-namespace -n "$contourNamespace" --set "namespaceOverride=$contourNamespace" \
-             --set 'envoy.kind=deployment' --set 'contour.replicaCount=1' \
-             --set-json "contour.nodeSelector=$contourSelector"  --set-json "envoy.nodeSelector=$contourSelector" \
-             --set-json "contour.tolerations=$contourTolerations" --set-json "envoy.tolerations=$contourTolerations" \
-             --set-json 'envoy.useHostPort={"http": "true", "https": "true", "metrics": "true"}'
+## phase 2.3 provision Istio service mesh (i.e. independant of Flux in case we want to bootstrap the latter via operator)
+tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF | istioctl install --skip-confirmation --set 'profile=demo' -f -
+---
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  namespace: $istioNamespace
+  name: istiocontrolplane
+spec:
+  components:
+    base:
+      enabled: true
+    cni:
+      enabled: true
+    ingressGateways:
+    - enabled: true
+      name: istio-ingressgateway
+      k8s:
+        nodeSelector:
+          ingress-ready: 'true'
+        service:
+          type: NodePort
+        overlays:
+        - apiVersion: apps/v1
+          kind: Deployment
+          name: istio-ingressgateway
+          patches:
+          - path: spec.template.spec.tolerations
+            value:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+        - apiVersion: v1
+          kind: Service
+          name: istio-ingressgateway
+          patches:
+          - path: spec.ports
+            value:
+              - name: status-port
+                port: 15021
+                targetPort: 15021
+                nodePort: 30081
+                protocol: TCP
+              - name: http2
+                port: 8080
+                targetPort: 8080
+                nodePort: $ingressHttpNodePort
+                protocol: TCP
+              - name: https
+                port: 8443
+                targetPort: 8443
+                nodePort: $ingressHttpsNodePort
+                protocol: TCP
+  meshConfig:
+    accessLogFile: '/dev/stdout'
+    accessLogEncoding: 'JSON'
+  values:
+    cni:
+      excludeNamespaces:
+        - $istioNamespace
+        - kube-system
+EOF
+## phase 2.3.1 provision Istio central ingress gateway (routing HTTP traffic to Istio ingress service)
+tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF | kubectl apply -f -
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: $istioIngressGateway
+  namespace: $istioNamespace
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 8080
+      name: http2
+      protocol: HTTP
+    hosts:
+    - '*'
+  - port:
+      number: 8443
+      name: https
+      protocol: HTTP
+    hosts:
+    - '*'
+EOF
 
 ## phase 2.4 provision OCI registry (independent from Flux, so we can practice gitless GitOps)
 kubectl create namespace "$zotNamespace"
+kubectl label namespace "$zotNamespace" istio-injection=enabled
 gitolitePod="$(kubectl get pod -n "$gitoliteNamespace" -l "app=gitolite" -o name)"
 kubectl exec -n gitolite "$gitolitePod" -i -- \
         sh -c 'cd /tmp && openssl req -quiet -x509 -nodes -days 365 -newkey rsa:2048 -keyout zot.key -out zot.crt \
                                       -subj "/CN=site.local" -addext "subjectAltName=DNS:site.local"'
-(cd "$kindTmpDir"
+(cd "$KIND_TMP_DIR"
  kubectl exec -n "$gitoliteNamespace" "$gitolitePod" -i -- cat /tmp/zot.crt > zot.crt
  kubectl exec -n "$gitoliteNamespace" "$gitolitePod" -i -- cat /tmp/zot.key > zot.key
  kubectl create -n "$zotNamespace" secret tls zot-tls --cert=zot.crt --key=zot.key)
 helm repo add project-zot "$zotChartUrl"
 helm install -n "$zotNamespace" zot project-zot/zot \
-             --set 'persistence=true' --set 'pvc.storage=20Gi' --set 'pvc.storageClassName=standard' \
-             --set 'ingress.enabled=true' --set 'ingress.className=contour' \
-             --set-json 'ingress.hosts=[{"host": "site.local", "paths": [{"path": "/"}]}]' \
-             --set-json 'ingress.tls=[{"secretName": "zot-tls", "hosts": ["site.local"]}]'
+             --set 'persistence=true' --set 'pvc.storage=20Gi' --set 'pvc.storageClassName=standard'
 sleep 2 # give zot workload time to show up, so that it can be waited for
 kubectl -n "$zotNamespace" wait --for=condition=ready --timeout="${KIND_KUSTOMIZATION_WAIT_TIMEOUT:-4m}" \
         pod -l "app.kubernetes.io/name=zot"
+tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF | kubectl apply -f - # expose zot via Istio CR, rewriting application root to /zot
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: zot
+  namespace: $zotNamespace
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - $istioNamespace/$istioIngressGateway
+  http:
+  - match:
+    - uri:
+        exact: '/zot' # rewriting application root does not work w/o exact match!
+    - uri:
+        prefix: '/zot/'
+    rewrite:
+      uri: '/'
+    route:
+    - destination:
+        host: zot.$zotNamespace.svc.cluster.local
+        port:
+          number: 5000
+EOF
 
 status=$?
 envTrueCheck "$KINDOFLUX_ONLY_K8S" && finishInfoExit $status
