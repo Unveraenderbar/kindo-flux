@@ -423,7 +423,24 @@ kubectl -n "$gitoliteNamespace" create secret generic "$gitoliteNamespace" \
                                                       "--from-literal=clone_command=$gitoliteCloneCmd"
 
 ## phase 2.3 provision Istio service mesh (i.e. independant of Flux in case we want to bootstrap the latter via operator)
-tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF | istioctl install --skip-confirmation --set 'profile=demo' -f -
+openSslOpts='-sha256 -days 365'
+openSslReqOpts="req -quiet $openSslOpts -x509 -nodes -newkey rsa:2048"
+kubeSslCmd="kubectl exec -n gitolite $gitolitePod -c openssh -i --"
+kubectl create namespace "$istioNamespace"
+$kubeSslCmd \
+        sh -c "set -e; cd /tmp \
+               && openssl $openSslReqOpts -subj '/CN=localhost/O=localhost CA'                    -keyout ingress-ca.key -out ingress-ca.crt \
+               && openssl req -quiet -nodes -newkey rsa:2048 -subj '/CN=ingress.localhost/O=localhost Istio ingress' -keyout ingress.key -out ingress.csr \
+               && openssl x509 -req $openSslOpts -CA ingress-ca.crt -CAkey ingress-ca.key -set_serial 0 -in ingress.csr -out ingress.crt -extfile <(printf 'subjectAltName=DNS:localhost')"
+(cd "$KIND_TMP_DIR" && mkdir crt key
+ $kubeSslCmd cat /tmp/ingress-ca.crt > crt/ingress-ca.crt
+ $kubeSslCmd cat /tmp/ingress-ca.key > key/ingress-ca.key
+ $kubeSslCmd cat /tmp/ingress.crt    > crt/ingress.crt
+ $kubeSslCmd cat /tmp/ingress.key    > key/ingress.key
+ kubectl create -n "$istioNamespace" secret tls ingress-tls --cert=crt/ingress.crt --key=key/ingress.key)
+
+tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF \
+| istioctl install --skip-confirmation --readiness-timeout=15m --set 'profile=demo' -f -
 ---
 apiVersion: install.istio.io/v1alpha1
 kind: IstioOperator
@@ -484,43 +501,48 @@ spec:
         - $istioNamespace
         - kube-system
 EOF
-## phase 2.3.1 provision Istio central ingress gateway (routing HTTP traffic to Istio ingress service)
+# phase 2.3.1 provision Istio central ingress gateway (routing HTTP traffic to Istio ingress service)
 tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF | kubectl apply -f -
 ---
 apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
-  name: $istioIngressGateway
+  name: $istioIngressGateway-http
   namespace: $istioNamespace
 spec:
   selector:
     istio: ingressgateway
   servers:
-  - port:
+  - hosts:
+    - '*'
+    port:
       number: 8080
       name: http2
       protocol: HTTP
-    hosts:
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: $istioIngressGateway-https
+  namespace: $istioNamespace
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - hosts:
     - '*'
-  - port:
+    port:
       number: 8443
       name: https
-      protocol: HTTP
-    hosts:
-    - '*'
+      protocol: HTTPS
+    tls:
+      mode: SIMPLE
+      credentialName: ingress-tls
 EOF
 
 ## phase 2.4 provision OCI registry (independent from Flux, so we can practice gitless GitOps)
 kubectl create namespace "$zotNamespace"
 kubectl label namespace "$zotNamespace" istio-injection=enabled
-gitolitePod="$(kubectl get pod -n "$gitoliteNamespace" -l "app=gitolite" -o name)"
-kubectl exec -n gitolite "$gitolitePod" -i -- \
-        sh -c 'cd /tmp && openssl req -quiet -x509 -nodes -days 365 -newkey rsa:2048 -keyout zot.key -out zot.crt \
-                                      -subj "/CN=site.local" -addext "subjectAltName=DNS:site.local"'
-(cd "$KIND_TMP_DIR"
- kubectl exec -n "$gitoliteNamespace" "$gitolitePod" -i -- cat /tmp/zot.crt > zot.crt
- kubectl exec -n "$gitoliteNamespace" "$gitolitePod" -i -- cat /tmp/zot.key > zot.key
- kubectl create -n "$zotNamespace" secret tls zot-tls --cert=zot.crt --key=zot.key)
 helm repo add project-zot "$zotChartUrl"
 helm install -n "$zotNamespace" zot project-zot/zot \
              --set 'persistence=true' --set 'pvc.storage=20Gi' --set 'pvc.storageClassName=standard'
@@ -528,7 +550,6 @@ sleep 2 # give zot workload time to show up, so that it can be waited for
 kubectl -n "$zotNamespace" wait --for=condition=ready --timeout="${KIND_KUSTOMIZATION_WAIT_TIMEOUT:-4m}" \
         pod -l "app.kubernetes.io/name=zot"
 tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF | kubectl apply -f - # expose zot via Istio CR, rewriting application root to /zot
----
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
@@ -538,16 +559,9 @@ spec:
   hosts:
   - "*"
   gateways:
-  - $istioNamespace/$istioIngressGateway
+  - $istioNamespace/$istioIngressGateway-http
   http:
-  - match:
-    - uri:
-        exact: '/zot' # rewriting application root does not work w/o exact match!
-    - uri:
-        prefix: '/zot/'
-    rewrite:
-      uri: '/'
-    route:
+  - route:
     - destination:
         host: zot.$zotNamespace.svc.cluster.local
         port:
