@@ -18,6 +18,11 @@ The resulting setup should
 
 kindo-flux consists of:
 - the main shell script
+- a variant of said script for deploying the
+  [Flux D2 reference architecture](flux-d2).  
+  - in order to enable this, a [zot](zot) registry is provisioned
+  - for exposure of the k8s services to the Kind host machine, the
+    [Istio](istio) service mesh is set up (accessible via node ports)
 - an auxiliary interactive shell setup for managing kubectl
   [contexts][kubectl-contexts] in a read-only fashion
 - an auxiliary shell script for adding packages and package repositories
@@ -75,9 +80,11 @@ a dedicated WSL instance for the containerized k8s anyway.
 [ArgoCD]: https://argo-cd.readthedocs.io/en/stable/
 [clusterctl-cli]: https://github.com/kubernetes-sigs/cluster-api/releases
 [flux2]: https://github.com/fluxcd/flux2
+[flux-d2]: https://fluxcd.control-plane.io/guides/d2-architecture-reference/
 [flux-cli]: https://github.com/fluxcd/flux2/releases
 [git]: https://github.com/gitolite/gitolite
 [inotify]: https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files
+[istio]: https://oneuptime.com/blog/post/2026-02-24-how-to-configure-istio-gateway-with-custom-ports
 [kind]: https://kind.sigs.k8s.io/docs/user/quick-start/
 [kind-cli]: https://github.com/kubernetes-sigs/kind/releases
 [k8s]: https://kubernetes.io/
@@ -88,3 +95,4 @@ a dedicated WSL instance for the containerized k8s anyway.
 [shellcheck]: https://github.com/koalaman/shellcheck
 [WSL]: https://learn.microsoft.com/en-us/windows/wsl/
 [yq]: https://github.com/mikefarah/yq
+[zot]: https://github.com/project-zot/zot

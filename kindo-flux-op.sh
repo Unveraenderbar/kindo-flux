@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # General kind-related parameters:
 k8sVersion="${KIND_K8s_VERSION:-v1.36.1}"
@@ -26,7 +26,6 @@ gitosshImg="$gitosshName:${GITOSSH_TAG:-latest}"
 gitoliteUser="${GITOLITE_USERNAME:-git}"
 gitoliteAdminKeyFile="${GITOSSH_ADMIN_KEY_FILE:-$KIND_TMP_DIR/gitolite.ecdsa}"
 gitoliteAdminClone="${GITOLITE_ADMIN_CLONE:-$KIND_TMP_DIR/gitolite-admin}"
-gitoliteConfFile="$gitoliteAdminClone/conf/gitolite.conf"
 gitoliteLocalBaseUrl="ssh://$gitoliteUser@localhost:$opensshNodePort"
 gitoliteSSHCmd='ssh -o IdentityAgent=none -F /dev/null -i'
 
@@ -40,69 +39,10 @@ gitIsRepoUnchanged() {
 
 # FluxCD related parameters:
 fluxNamespace="${KIND_FLUX_NAMESPACE:-flux-system}"
-fluxBootNamespace="${KIND_FLUX_BOOT_NAMESPACE:-flux-bootstrap}"
 fluxVersion="${FLUX_VERSION:-2.9.2}"
 fluxUrl="https://github.com/fluxcd/flux2/releases/download/v$fluxVersion/flux_${fluxVersion}_linux_amd64.tar.gz"
 gitoliteFluxKeyFile="${GITOSSH_FLUX_KEY_FILE:-$KIND_TMP_DIR/$fluxNamespace.ecdsa}"
 gitoliteFluxPubKeyFile="$gitoliteAdminClone/keydir/$fluxNamespace.pub"
-fluxCloneDir="${KIND_FLUX_CLONE_DIR:-$KIND_TMP_DIR/$fluxNamespace}"
-
-# ArgoCD related parameters:
-argoCdNamespace="${KIND_FLUX_NAMESPACE:-argocd}"
-argoCdVersion="${ARGOCD_VERSION:-stable}"
-argoCdUrl="https://raw.githubusercontent.com/argoproj/argo-cd/$argoCdVersion/manifests/install.yaml"
-argocdNodePort="$((${ARGOCD_NODE_PORT:-${nodePortPrefix}0333} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
-
-# k8s cluster API  related parameters:
-clusterApiProviderNamespace="${CLUSTER_API_PROVIDER_NAMESPACE:-capi}"
-clusterApiTestNamespace="${CLUSTER_API_PROVIDER_NAMESPACE:-capv-test}"
-vclusterNodePort="$((${VCLUSTER_NODE_PORT:-${nodePortPrefix}0444} + ${K8S_KIND_NODEPORT_OFFSET:-0}))"
-clusterApiHelmValues='service:\n  type: NodePort'
-clusterApiEnvPatch="patches:
-- target:
-    kind: Deployment
-    name: .*
-  patch: |-
-    - op: add
-      path: '/spec/template/spec/containers/0/env/-'
-      value:
-        name: CLUSTER_NAME
-        value: '$clusterName'
-    - op: add
-      path: '/spec/template/spec/containers/0/env/-'
-      value:
-        name: CLUSTER_NAMESPACE
-        value: '$clusterApiProviderNamespace'
-    - op: add
-      path: '/spec/template/spec/containers/0/env/-'
-      value:
-        name: KUBERNETES_VERSION
-        value: '$k8sVersion'
-    - op: add
-      path: '/spec/template/spec/containers/0/env/-'
-      value:
-        name: HELM_VALUES
-        value: '$clusterApiHelmValues'
-- target:
-    kind: VCluster
-    name: $clusterApiTestNamespace
-  patch: |-
-    - op: replace
-      path: '/spec/helmRelease/chart/name'
-      value: ''
-    - op: replace
-      path: '/spec/helmRelease/chart/repo'
-      value: ''
-    - op: replace
-      path: '/spec/helmRelease/chart/version'
-      value: ''
-- target:
-    kind: Deployment
-    name: cluster-api-provider-vcluster-controller-manager
-  patch: |-
-    - op: replace
-      path: '/spec/template/spec/containers/1/image'
-      value: 'docker.io/kubebuilder/kube-rbac-proxy:v0.8.0' # default tries to pull from ghcr.io where the image is not available?"
 
 fluxWaitForKustomization() {
     kubeCtl() { kubectl -n "$fluxNamespace" "$@"; }
@@ -113,59 +53,8 @@ fluxWaitForKustomization() {
     kubectl get -A gitrepositories,kustomizations
 }
 
-fluxAddComponent() {( # run in sub-shell to isolate git SSH command / working directory
-    rm -rf "$fluxCloneDir"
-    # shellcheck disable=SC2030,SC2031
-    export GIT_SSH_COMMAND="$gitoliteSSHCmd $gitoliteFluxKeyFile"
-    git clone "$gitoliteLocalBaseUrl/$fluxNamespace" "$fluxCloneDir"
-    componentSubDir="clusters/$clusterName/$1"
-    mkdir -p "$fluxCloneDir/$componentSubDir"
-    cd "$fluxCloneDir/$componentSubDir"
-    eval "${7:-wget -O- \"$2\"}" > "$1-components.yaml"
-    if ! gitIsRepoUnchanged; then
-        git add .; git commit -m "Add $3 for kind manifests"; git push
-    fi
-
-    tee "$1-sync.yaml" <<-EOF
-	apiVersion: kustomize.toolkit.fluxcd.io/v1
-	kind: Kustomization
-	metadata:
-	  labels:
-	    kustomize.toolkit.fluxcd.io/name: $1
-	    kustomize.toolkit.fluxcd.io/namespace: $fluxNamespace
-	  name: $1
-	  namespace: $fluxNamespace
-	spec:
-	  force: false
-	  interval: 1m0s
-	  path: ./$componentSubDir
-	  prune: true
-	  sourceRef:
-	    kind: GitRepository
-	    name: $fluxNamespace
-	EOF
-
-    tee kustomization.yaml <<-EOF
-	apiVersion: kustomize.config.k8s.io/v1beta1
-	kind: Kustomization
-	resources:
-	- $1-components.yaml
-	- $1-sync.yaml
-	$(echo "$6" | sed 's/^	*//')
-	EOF
-
-    if ! gitIsRepoUnchanged; then
-        git add .; git commit -m "Add $3 for kind sync manifests"; git push
-    fi
-    kubectl -n "$fluxNamespace" apply -f "$1-sync.yaml"
-    fluxWaitForKustomization "$1"
-    kubectl -n "$4" wait pod -l "$5" --for=condition=ready --timeout="${K8S_POD_WAIT_TIMEOUT:-6m}"
-)}
-
 istioNamespace="${KIND_CONTOUR_NAMESPACE:-istio-system}"
 istioIngressGateway='ingress-gateway'
-
-metricsServerUrl="${KIND_METRICS_SERVER_DEPLOYMENT_URL:-https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml}"
 
 export HELM_CACHE_HOME="$KIND_TMP_DIR/.cache/helm" HELM_CONFIG_HOME="$KIND_TMP_DIR/.config/helm"
 zotChartUrl="${ZOT_HELM_CHART_URL:-http://zotregistry.dev/helm-charts}"
@@ -182,8 +71,6 @@ finishInfoExit() {
     printf "\nexport KUBECONFIG='%s'\n" "$kubeConfig"
     gitolitePrintCloneCmd "$gitoliteAdminKeyFile" gitolite-admin
     envTrueCheck "$KINDOFLUX_ONLY_K8S" || gitolitePrintCloneCmd "$gitoliteFluxKeyFile"  "$fluxNamespace"
-    envTrueCheck "$KINDOFLUX_ARGO" \
-        && echo "argocd login localhost:$argocdNodePort --insecure --username admin --password \"\$(kubectl -n $argoCdNamespace get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)\""
     echo "export KIND_TMP_DIR=$KIND_TMP_DIR"
     exit "$1"
 }
@@ -203,7 +90,7 @@ lsmod | awk '$1 == "ip_tables" {exit 0}' || {
     exit 1
 }
 
-set -ex
+set -euxo pipefail
 kindPath="$(command -v kind)"
 [ -n "$kindPath" ] || exit 1
 kindCmd="KIND_EXPERIMENTAL_PROVIDER=podman $kindPath"
@@ -211,6 +98,7 @@ kindCmd="KIND_EXPERIMENTAL_PROVIDER=podman $kindPath"
 if [ -n "$(mount -lt cgroup)" ]; then
     sudo='sudo'             # WSL messed-up/outdated cgroups, cannot run rootless
 else
+    sudo=''
     unprivilegedPort='true' # running rootless, cannot expose privileged ports
 fi
 
@@ -273,12 +161,6 @@ nodes:
     protocol: TCP
   - containerPort: $opensshNodePort
     hostPort: $opensshNodePort
-    protocol: TCP
-  - containerPort: $argocdNodePort
-    hostPort: $argocdNodePort
-    protocol: TCP
-  - containerPort: $vclusterNodePort
-    hostPort: $vclusterNodePort
     protocol: TCP
 $(seq 1 "${KIND_NUM_NODES:-2}" | xargs -rn1 sh -c "printf -- \"- role: worker\n\"")
 EOF
@@ -569,143 +451,262 @@ spec:
 EOF
 
 status=$?
-envTrueCheck "$KINDOFLUX_ONLY_K8S" && finishInfoExit $status
+envTrueCheck "${KINDOFLUX_ONLY_K8S:-}" && finishInfoExit $status
 
-## phase 2.5 instantiate FluxCD base git repository:
+## phase 2.4 instantiate Flux D2 reference architecture
+## https://fluxcd.control-plane.io/guides/d2-architecture-reference/
 
-rm -rf "$gitoliteAdminClone" "$gitoliteFluxKeyFile" "$gitoliteFluxPubKeyFile"
-# shellcheck disable=SC2030,SC2031
-(export GIT_SSH_COMMAND="$gitoliteSSHCmd $gitoliteAdminKeyFile"
-    git clone "$gitoliteLocalBaseUrl/gitolite-admin" "$gitoliteAdminClone"
-    cd "$gitoliteAdminClone"
-    if ! grep -q "^repo $fluxNamespace" "$gitoliteConfFile"; then # flux bootstrap expects 'flux-system' repo
-        printf "\nrepo %s\n    RW+     =   %s\n" "$fluxNamespace" "$fluxNamespace" >> "$gitoliteConfFile"
-    fi
-    if gitIsRepoUnchanged; then
-        ssh-keygen -qt ed25519 -a 64 -P '' -C "$fluxNamespace" -f "$gitoliteFluxKeyFile"
-        mv "$gitoliteFluxKeyFile.pub" "$gitoliteFluxPubKeyFile"
-    fi
-    if ! gitIsRepoUnchanged; then
-        git add "$gitoliteConfFile" "$gitoliteFluxPubKeyFile"
-        git commit -m 'added fluxcd'
-        git push
-    fi)
+set +ex # bash's read builtin returns != 0, pause exit on error for variable initialization
 
-## phase 2.6 bootstrap FluxCD controllers and initial kustomization:
+fluxOrg='controlplaneio-fluxcd'
+fluxPush='flux push artifact --verbose --debug --insecure-registry'
+localDomain="${LOCAL_DOMAIN:-localhost}"
+localRegistry="$localDomain:${LOCAL_REGISTRY_PORT:-30080}"
+clusterRegistry="${CLUSTER_REGISTRY:-zot.zot:5000}"
+fleetRepoDir="${FLEET_REPO_DIR:-d2-fleet}"
+fluxNamespace="${FLUX_NAMESPACE:-flux-system}"
+fluxStageDir="${FLUX_STAGE:-clusters/staging}"
+fluxNamespaceDir="$fleetRepoDir/$fluxStageDir/$fluxNamespace"
+fluxTransformersDir="$fleetRepoDir/transformers"
+operatorChart="$fluxOrg/charts/flux-operator"
+remoteRegistryHost="${REMOTE_REGISTRY_HOST:-ghcr.io}"
+remoteRegistry="$remoteRegistryHost/$fluxOrg"
+localFleetUrl="$localRegistry/$fluxOrg/$fleetRepoDir"
 
-kubectl create namespace "$fluxBootNamespace"
-kubectl -n "$fluxBootNamespace" create secret generic "$fluxNamespace" \
-                                                      "--from-file=id_ecdsa=$gitoliteFluxKeyFile" \
-                                                      "--from-literal=known_hosts=$k8sServerPubKey"
-kubectl -n "$fluxBootNamespace" create serviceaccount "$fluxBootNamespace"
-tee "${KIND_FLUXCD_BOOTSTRAP_DEBUG:-/dev/stderr}" <<-EOF | kubectl apply -f -
+appsRepoDir="${APPS_REPO_DIR:-d2-apps}"
+infraRepoDir="${INFRA_REPO_DIR:-d2-infra}"
+localInfraCertManagerUrl="$localRegistry/$fluxOrg/$infraRepoDir/cert-manager"
+localInfraMonitoringUrl="$localRegistry/$fluxOrg/$infraRepoDir/monitoring"
+
+IFS='' read -r -d '' fluxRegistryTranformers <<-EOF
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: $fluxBootNamespace
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: cluster-admin
-subjects:
-- apiGroup: ""
-  kind: ServiceAccount
-  name: $fluxBootNamespace
-  namespace: $fluxBootNamespace
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
 
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $fluxBootNamespace
-  namespace: $fluxBootNamespace
-spec:
-  containers:
-  - args:
-    - '--path'
-    - 'clusters/$clusterName'
-    - '--private-key-file=/root/.ssh/id_ecdsa' # flux tries to start SSH agent if given no private key
-    - '--timeout=${FLUX_BOOTSTRAP_TIMEOUT:-12m}'
-    - '--url=ssh://git@$k8sSshSvcName:$opensshPort/$fluxNamespace'
-    # flux aborts w/o error message if started w/o silent option!
-    command: ['flux', 'bootstrap', 'git', '--silent', '--branch', 'master', '--interval', '1m']
-    image: $gitosshImg
-    imagePullPolicy: Never
-    name: $fluxBootNamespace
-    volumeMounts:
-    - mountPath: /root/.ssh # mounting secret in home directory provides known_hosts file
-      name: $fluxNamespace
-  serviceAccount: $fluxBootNamespace
-  volumes:
-  - name: $fluxNamespace
-    secret:
-      defaultMode: 0400
-      secretName: $fluxNamespace
+replacements:
+- sourceValue: $clusterRegistry
+  targets:
+  - select:
+      kind: FluxInstance
+    fieldPaths:
+    - spec.sync.url
+    options:
+      delimiter: /
+      index: 2
+  - select:
+      kind: ResourceSet
+      name: apps|flux-operator|infra
+    fieldPaths:
+    - spec.resources.[kind=OCIRepository].spec.url
+    options:
+      delimiter: /
+      index: 2
 EOF
 
-kubectl -n "$fluxBootNamespace" wait --for=condition=ready pod "$fluxBootNamespace"
-kubectl -n "$fluxBootNamespace" logs -f "$fluxBootNamespace"
-fluxWaitForKustomization "$fluxNamespace"
-kubectl delete namespace "$fluxBootNamespace"
-fluxCloneCmd="$(gitolitePrintCloneCmd "$gitoliteFluxKeyFile" "$fluxNamespace" | base64 -w0)"
-kubectl -n "$fluxNamespace" patch secret "$fluxNamespace" --type json \
-        -p '[{"op": "add", "path": "/data/clone_command", "value": "'"$fluxCloneCmd"'"}]'
+IFS='' read -r -d '' fluxInstancePatch <<-EOF
+components:
+- ../../../transformers
+patches:
+- patch: '[  {"op": "remove", "path": "/spec/sync/pullSecret"      }
+           , {"op": "remove", "path": "/spec/distribution/artifact"}]'
+  target:
+    kind: FluxInstance
+    name: flux
+- patch: |-
+    - op: replace
+      path: /spec/kustomize/patches/0
+      value:
+        patch: |
+          - op: add
+            path: /spec/insecure
+            value: true
+        target:
+          kind: OCIRepository
+          name: flux-(operator|system)
+  target:
+    kind: FluxInstance
+    name: flux
+- patch: |-
+    - op: remove
+      path: /spec/resources/0/spec/verify
+  target:
+    kind: ResourceSet
+    name: flux-operator
+- patch: |-
+    - op: replace
+      path: /data/CLUSTER_DOMAIN
+      value: $localDomain
+  target:
+    kind: ConfigMap
+    name: flux-runtime-info
 
-## phase 3.1 provision k8s metrics server via FluxCD kustomization:
+replacements:
+- source:
+    fieldPath: spec.cluster.multitenant
+    kind: FluxInstance
+    name: flux
+  targets:
+  - select:
+      kind: ResourceSet
+      name: flux-(operator|system)
+    fieldPaths:
+    - spec.resources.[kind=OCIRepository].spec.insecure
+    options:
+      create: true
+EOF
 
-fluxAddComponent metrics-server "$metricsServerUrl" 'Metrics Server' kube-system k8s-app=metrics-server \
-					'patches:
-					- target:
-					    kind: Deployment
-					    name: metrics-server
-					  patch: |-
-					    - op: add
-					      path: "/spec/template/spec/containers/0/args/-"
-					      value: "--kubelet-insecure-tls"'
+IFS='' read -r -d '' fluxStagingPatch <<-EOF
+patches:
+- patch: |-
+    - op: add
+      path: /spec/components
+      value: [../transformers]
+  target:
+    kind: Kustomization
+    name: tenants
+EOF
 
-## phase 3.2 optionally, provision ArgoCD GitOps toolkit via FluxCD kustomization:
-if envTrueCheck "$KINDOFLUX_ARGO"; then
-    kubectl create ns "$argoCdNamespace"
-    fluxAddComponent argocd "$argoCdUrl" 'ArgoCD GitOps toolkit' "$argoCdNamespace" 'partOf=ArgoCD' \
-					"commonLabels:
-					  partOf: ArgoCD
-					namespace: $argoCdNamespace # ArgoCD resources are not namespaced...
-					patches:
-					- target:
-					    kind: Kustomization
-					    name: argocd
-					  patch: |-
-					    - op: replace
-					      path: '/metadata/namespace'
-					      value: $fluxNamespace  # ... but namespace for kustomization must be that of Flux 
-					- target:
-					    kind: Service
-					    name: argocd-server
-					  patch: |-
-					    - op: replace
-					      path: '/spec/type'
-					      value: NodePort
-					    - op: add
-					      path: '/spec/ports/1/nodePort'
-					      value: $argocdNodePort"
-fi
+IFS='' read -r -d '' fluxTenantsPatch <<-EOF
+components:
+- ../transformers
 
-## phase 3.3 optionally, provision k8s-in-k8s via cluster API with vcluster provider (does not work due to VCluster 0.34.0 inconsistencies with kube-rbac-proxy):
-if envTrueCheck "$KINDOFLUX_CLUSTERAPI"; then
-    kubectl create ns "$clusterApiProviderNamespace"
-    clusterctl init -v 10 --infrastructure vcluster --target-namespace "$clusterApiProviderNamespace" --wait-providers
-    kubectl create ns "$clusterApiTestNamespace"
-    fluxAddComponent "$clusterApiTestNamespace" '' 'k8s Cluster API' "$clusterApiTestNamespace" "partOf=$clusterApiTestNamespace" \
-                     "$clusterApiEnvPatch" \
-                     "export CLUSTER_NAME=$clusterName CLUSTER_NAMESPACE=$clusterApiProviderNamespace KUBERNETES_VERSION=$k8sVersion HELM_VALUES='$clusterApiHelmValues';
-                      clusterctl generate cluster $clusterApiTestNamespace --target-namespace $clusterApiProviderNamespace --kubernetes-version $k8sVersion --control-plane-machine-count=1 --worker-machine-count=2 "
-fi
+patches:
+- patch: '[  {"op": "remove", "path": "/spec/resources/3/imagePullSecrets"}
+           , {"op": "remove", "path": "/spec/resources/5/spec/verify"     }
+           , {"op": "remove", "path": "/spec/resources/2"                 }]'
+  target:
+    kind: ResourceSet
+    name: apps|infra
 
-## phase 4 clean up, show k8s pod status and print some useful commands for
-#          interaction w/ cluster / FluxCD via gitolite / argocd CLI, using
-#          the current parametrization:
+replacements:
+- source:
+    fieldPath: spec.dependsOn.0.ready
+    kind: ResourceSet
+    name: infra
+  targets:
+  - select:
+      kind: ResourceSet
+      name: apps|infra
+    fieldPaths:
+    - spec.resources.[kind=OCIRepository].spec.insecure
+    options:
+      create: true
+- sourceValue: oci://$clusterRegistry/$fluxOrg/
+  targets:
+  - select:
+      kind: ResourceSet
+      name: policies
+    fieldPaths:
+    - spec.resources.[kind=ConfigMap].data.sources
+    options:
+      create: true
+      delimiter: ' '
+      index: 9999
+- sourceValue: 18m
+  targets:
+  - select:
+      kind: ResourceSet
+      name: infra
+    fieldPaths:
+    - spec.resources.[kind=Kustomization].spec.timeout
+    options:
+      create: true
+EOF
 
-rm -rf "$kindConfig" "$gitosshImgArchive" "$gitoliteAdminKeyFile.pub" "$gitoliteAdminClone" "$fluxCloneDir"
+IFS='' read -r -d '' infraHelmReleasePatch <<-EOF # Grafana deployment lets infra-controllers HelmRelease CR fail reproducibly
+replacements:
+- sourceValue: 18m
+  targets:
+  - select:
+      kind: HelmRelease
+    fieldPaths:
+    - spec.install.timeout
+    - spec.upgrade.timeout
+    options:
+      create: true
+- sourceValue: RetryOnFailure
+  targets:
+  - select:
+      kind: HelmRelease
+    fieldPaths:
+    - spec.install.strategy.name
+    - spec.upgrade.strategy.name
+    options:
+      create: true
+EOF
 
-finishInfoExit $?
+_localCopy() {
+    local tag="${2:-latest}"
+    skopeo copy --src-registry-token "${GHCR_BEARER_TOKEN:-QQ==}" --dest-tls-verify=false \
+                "docker://$1:$tag" "docker://${1/$remoteRegistryHost/$localRegistry}:$tag"
+}
+
+_autoKustomizate() {
+    (cd "$1"; kustomize create --autodetect --recursive)
+    cat >> "$1/kustomization.yaml"
+}
+
+set -ex
+
+# emulate pseudo-air-gap for reference architecture OCI artifacts (other artifacts/images are still pulled from GitHub registry):
+_localCopy "$remoteRegistryHost/$operatorChart" "${OPERATOR_CHART_VERSION:-0.54.1}"
+_localCopy "$remoteRegistry/flux-operator-manifests"
+_localCopy "$remoteRegistry/$infraRepoDir/cert-manager"
+_localCopy "$remoteRegistry/$appsRepoDir/backend"
+_localCopy "$remoteRegistry/$appsRepoDir/frontend"
+#_localCopy "$remoteRegistry/$fleetRepoDir"            # transformed below to local OCI registry...
+#_localCopy "$remoteRegistry/$infraRepoDir/monitoring" # ... via git repo instead
+
+[ -n "${KIND_TMP_DIR:-}" ] && cd "$KIND_TMP_DIR"
+
+rm -rf "$fleetRepoDir"; git clone "https://github.com/$fluxOrg/$fleetRepoDir"
+mkdir -p "$fluxTransformersDir"
+cat >            "$fluxTransformersDir/kustomization.yaml" <<<"$fluxRegistryTranformers"
+cat >>           "$fluxNamespaceDir/kustomization.yaml"    <<<"$fluxInstancePatch"
+_autoKustomizate "$fleetRepoDir/$fluxStageDir"             <<<"$fluxStagingPatch"
+_autoKustomizate "$fleetRepoDir/tenants"                   <<<"$fluxTenantsPatch"
+(cd "$fluxNamespaceDir"; git add .; git commit -m 'chore: add patch for localizing OCI registry')
+
+$fluxPush "oci://$localFleetUrl" --path "$fleetRepoDir" --source "https://$localFleetUrl" \
+          "--revision=$(cd "$fleetRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
+
+rm -rf "$infraRepoDir"; git clone "https://github.com/$fluxOrg/$infraRepoDir"
+cat >> "$infraRepoDir/components/cert-manager/controllers/base/kustomization.yaml" <<<"$infraHelmReleasePatch"
+cat >> "$infraRepoDir/components/monitoring/controllers/base/kustomization.yaml"   <<<"$infraHelmReleasePatch"
+(cd "$infraRepoDir"; git add .; git commit -m 'chore: add patch for increasing HelmRelease CR timeouts')
+
+$fluxPush "oci://$localInfraCertManagerUrl" --path "$infraRepoDir/components/cert-manager" --source "https://$localInfraCertManagerUrl" \
+          "--revision=$(cd "$infraRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
+$fluxPush "oci://$localInfraMonitoringUrl" --path "$infraRepoDir/components/monitoring" --source "https://$localInfraMonitoringUrl" \
+          "--revision=$(cd "$infraRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
+
+## phase 2.4.1 bootstrap Flux ControlPlane operator via Helm
+kubectl create namespace "$fluxNamespace"
+kubectl label namespace "$fluxNamespace" 'istio-injection=enabled'
+helm delete  -n "$fluxNamespace" --wait --cascade orphan --ignore-not-found flux-operator # try to act idempotent
+helm install -n "$fluxNamespace" --wait --plain-http --create-namespace --replace \
+             -f "$fleetRepoDir/$fluxStageDir/$fluxNamespace/flux-operator-values.yaml" \
+             flux-operator "oci://$localRegistry/$operatorChart"
+
+## phase 2.4.2 bootstrap Flux ControlPlane FluxInstance CR patched for Kind
+kubectl -n "$fluxNamespace" apply -k "$fluxNamespaceDir" -o 'jsonpath={.items[?(@.kind=="FluxInstance")]}' | jq .spec
+kubectl -n "$fluxNamespace" wait fluxinstance/flux --for=condition=Ready --timeout=15m
+
+## phase 2.4.3 expose Flux operator web UI via Istio
+tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF | kubectl -n "$fluxNamespace" apply -f -
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: flux-web
+spec:
+  hosts:
+  - '*'
+  gateways:
+  - $istioNamespace/$istioIngressGateway-https
+  http:
+  - route:
+    - destination:
+        host: flux-operator
+        port:
+          number: 9080
+EOF
