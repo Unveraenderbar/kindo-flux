@@ -168,7 +168,7 @@ istioIngressGateway='ingress-gateway'
 metricsServerUrl="${KIND_METRICS_SERVER_DEPLOYMENT_URL:-https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml}"
 
 export HELM_CACHE_HOME="$KIND_TMP_DIR/.cache/helm" HELM_CONFIG_HOME="$KIND_TMP_DIR/.config/helm"
-zotChartUrl="${ZOT_HELM_CHART_URL:-http://zotregistry.dev/helm-charts}"
+zotChartUrl="${ZOT_HELM_CHART_URL:-oci://ghcr.io/project-zot/helm-charts/zot}"
 zotNamespace="${ZOT_NAMESPACE:-zot}"
 
 envTrueCheck() {
@@ -543,9 +543,7 @@ EOF
 ## phase 2.4 provision OCI registry (independent from Flux, so we can practice gitless GitOps)
 kubectl create namespace "$zotNamespace"
 kubectl label namespace "$zotNamespace" istio-injection=enabled
-helm repo add project-zot "$zotChartUrl"
-helm install -n "$zotNamespace" zot project-zot/zot \
-             --set 'persistence=true' --set 'pvc.storage=20Gi' --set 'pvc.storageClassName=standard'
+helm install -n "$zotNamespace" zot "$zotChartUrl" --set 'persistence=true' --set 'pvc.storage=20Gi' --set 'pvc.storageClassName=standard'
 sleep 2 # give zot workload time to show up, so that it can be waited for
 kubectl -n "$zotNamespace" wait --for=condition=ready --timeout="${KIND_KUSTOMIZATION_WAIT_TIMEOUT:-4m}" \
         pod -l "app.kubernetes.io/name=zot"
