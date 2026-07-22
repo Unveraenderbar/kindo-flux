@@ -40,7 +40,7 @@ gitIsRepoUnchanged() {
 # FluxCD related parameters:
 fluxNamespace="${KIND_FLUX_NAMESPACE:-flux-system}"
 fluxVersion="${FLUX_VERSION:-2.9.2}"
-fluxUrl="https://github.com/fluxcd/flux2/releases/download/v$fluxVersion/flux_${fluxVersion}_linux_amd64.tar.gz"
+fluxUrl="${GITHUB_PROXY_URL:-https://github.com}/fluxcd/flux2/releases/download/v$fluxVersion/flux_${fluxVersion}_linux_amd64.tar.gz"
 gitoliteFluxKeyFile="${GITOSSH_FLUX_KEY_FILE:-$KIND_TMP_DIR/$fluxNamespace.ecdsa}"
 gitoliteFluxPubKeyFile="$gitoliteAdminClone/keydir/$fluxNamespace.pub"
 
@@ -77,16 +77,15 @@ finishInfoExit() {
 
 ## phase 0 prepare:
 
-# see https://github.com/NixOS/nixpkgs/issues/36214 for summary and
-# documentation hub:
+# see https://github.com/NixOS/nixpkgs/issues/36214 for summary and documentation hub:
 inotifyMaxInstances="$(cat /proc/sys/fs/inotify/max_user_instances)"
 [ "$inotifyMaxInstances" -ge 512 ] || {
-    echo "Cannot provision ArgoCD, max. count $inotifyMaxInstances of inotify user instances too low for ArgoCD" 1>&2
-    echo "Run sudo sysctl sysctl fs.inotify.max_user_instances=8192 for correction" 1>&2
+    echo "Max. count $inotifyMaxInstances of inotify user instances too low, aborting" 1>&2
+    echo "Run \"sudo sysctl fs.inotify.max_user_instances=8192\" for correction" 1>&2
     exit 1
 }
 lsmod | awk '$1 == "ip_tables" {exit 0}' || {
-    echo "Cannot provision Contour ingress controllers as IP tables kernel module not loaded, aborting" 1>&2
+    echo "Cannot provision ingress controllers as IP tables kernel module not loaded, aborting" 1>&2
     exit 1
 }
 
@@ -114,13 +113,14 @@ if [ -z "$(podman images --noheading "$gitosshImg")" ]; then # trigger rebuild o
     buildah rmi "$opensshImg" "$gitosshImg" || true
     buildah from --name "$gitosshName" "$opensshImg"
     ${TZ:+buildah config --env TZ="$TZ" "$gitosshName"}
+    ${https_proxy:+buildah config --env https_proxy="$https_proxy" "$gitosshName"}
     # have to make port in sshd configuration runtime-parametrizable in case we install w/ offset!
     buildah run "$gitosshName" sh -exc \
             "apk update; apk upgrade; apk add ${GITOSSH_PKGS:-git perl gitolite openssl}
              sed -i -e 's/ \(2222\)/ \${OPENSSH_PORT:-\1}/' /etc/s6-overlay/s6-rc.d/svc-openssh-server/run
              usermod -u $gitoliteUid -g $gitoliteGid $gitoliteUser
-             wget -O- $fluxUrl | tar -oxzf - -C /usr/local/bin flux
-             wget -O    /usr/bin/kubectl $kubectlUrl
+             curl -sk $fluxUrl | tar -oxzf - -C /usr/local/bin flux
+             curl -sk $kubectlUrl >  /usr/bin/kubectl
              chmod 0555 /usr/bin/kubectl"
     buildah commit --rm "$gitosshName" "$gitosshImg"
 fi
@@ -164,7 +164,7 @@ nodes:
     protocol: TCP
 $(seq 1 "${KIND_NUM_NODES:-2}" | xargs -rn1 sh -c "printf -- \"- role: worker\n\"")
 EOF
-$sudo sh -exc "kind delete cluster --name $clusterName || true
+$sudo sh -exc "$kindCmd delete cluster --name $clusterName || true
                podman rm --filter name=$clusterName
                $kindCmd create cluster --image $kindImage --config $kindConfig
                $kindCmd export kubeconfig --kubeconfig=$kubeConfig --name $clusterName
@@ -465,14 +465,18 @@ fleetRepoDir="${FLEET_REPO_DIR:-d2-fleet}"
 fluxNamespace="${FLUX_NAMESPACE:-flux-system}"
 fluxStageDir="${FLUX_STAGE:-clusters/staging}"
 fluxNamespaceDir="$fleetRepoDir/$fluxStageDir/$fluxNamespace"
-fluxTransformersDir="$fleetRepoDir/transformers"
+fleetTransformersDir="$fleetRepoDir/transformers"
 operatorChart="$fluxOrg/charts/flux-operator"
 remoteRegistryHost="${REMOTE_REGISTRY_HOST:-ghcr.io}"
 remoteRegistry="$remoteRegistryHost/$fluxOrg"
 localFleetUrl="$localRegistry/$fluxOrg/$fleetRepoDir"
 
 appsRepoDir="${APPS_REPO_DIR:-d2-apps}"
+appsCompDir="$appsRepoDir/components"
+localAppsBackendUrl="$localRegistry/$fluxOrg/$appsRepoDir/backend"
+localAppsFrontendUrl="$localRegistry/$fluxOrg/$appsRepoDir/frontend"
 infraRepoDir="${INFRA_REPO_DIR:-d2-infra}"
+infraCompDir="$infraRepoDir/components"
 localInfraCertManagerUrl="$localRegistry/$fluxOrg/$infraRepoDir/cert-manager"
 localInfraMonitoringUrl="$localRegistry/$fluxOrg/$infraRepoDir/monitoring"
 
@@ -499,6 +503,35 @@ replacements:
     options:
       delimiter: /
       index: 2
+EOF
+
+IFS='' read -r -d '' airGapPatch <<-EOF
+transformers:
+- |-
+  apiVersion: builtin
+  kind: ReplacementTransformer
+  metadata:
+    name: registryProxyReplacement
+  replacements:
+  - sourceValue: $clusterRegistry
+    targets:
+    - select:
+        kind: OCIRepository
+      fieldPaths:
+      - spec.url
+      options:
+        delimiter: /
+        index: 2
+patches:
+- patch: |-
+    apiVersion: source.toolkit.fluxcd.io/v1
+    kind: OCIRepository
+    metadata:
+      name: irrelevant-here
+    spec:
+      insecure: true
+  target:
+    kind: OCIRepository
 EOF
 
 IFS='' read -r -d '' fluxInstancePatch <<-EOF
@@ -589,7 +622,7 @@ replacements:
     - spec.resources.[kind=OCIRepository].spec.insecure
     options:
       create: true
-- sourceValue: oci://$clusterRegistry/$fluxOrg/
+- sourceValue: oci://$clusterRegistry/$fluxOrg/${remoteRegistryProxy:-} oci://$clusterRegistry/bitnamicharts/redis oci://$clusterRegistry/stefanprodan/charts/podinfo oci://$clusterRegistry/bitnamicharts/memcached
   targets:
   - select:
       kind: ResourceSet
@@ -635,8 +668,17 @@ EOF
 
 _localCopy() {
     local tag="${2:-latest}"
-    skopeo copy --src-registry-token "${GHCR_BEARER_TOKEN:-QQ==}" --dest-tls-verify=false \
-                "docker://$1:$tag" "docker://${1/$remoteRegistryHost/$localRegistry}:$tag"
+    # shellcheck disable=SC2001 # need non-greedy RE, bash does not have these
+    skopeo copy --dest-tls-verify=false "docker://$1:$tag" "docker://$(echo "$1" | sed s#[^/]*#"$localRegistry"#):$tag"
+}
+
+_chartCopy() { # extract all OCIRepository CRs from Kustomization directories, and copy them to our local registry:
+    local yqExpr='select(.kind == "OCIRepository") | .spec | .url + " " + (.ref.tag // .ref.semver // "latest")'
+    for dir in "$@"; do
+        kustomize build "$dir" | yq eval-all -N "$yqExpr" | while read -r chart tag; do
+            _localCopy "${chart##oci://}" "$tag"
+        done
+    done
 }
 
 _autoKustomizate() {
@@ -646,39 +688,62 @@ _autoKustomizate() {
 
 set -ex
 
+## phase 2.4.1 prepare Flux ControlPlane OCI images patched for Kind / air-gapped platform:
+
 # emulate pseudo-air-gap for reference architecture OCI artifacts (other artifacts/images are still pulled from GitHub registry):
 _localCopy "$remoteRegistryHost/$operatorChart" "${OPERATOR_CHART_VERSION:-0.55.0}"
 _localCopy "$remoteRegistry/flux-operator-manifests"
-_localCopy "$remoteRegistry/$infraRepoDir/cert-manager"
-_localCopy "$remoteRegistry/$appsRepoDir/backend"
-_localCopy "$remoteRegistry/$appsRepoDir/frontend"
-#_localCopy "$remoteRegistry/$fleetRepoDir"            # transformed below to local OCI registry...
-#_localCopy "$remoteRegistry/$infraRepoDir/monitoring" # ... via git repo instead
+
+#_localCopy "$remoteRegistry/$fleetRepoDir"              # transformed below...
+#_localCopy "$remoteRegistry/$infraRepoDir/cert-manager" # ... to local OCI registry ...
+#_localCopy "$remoteRegistry/$infraRepoDir/monitoring"   # ... via git repo instead
+#_localCopy "$remoteRegistry/$appsRepoDir/backend"
+#_localCopy "$remoteRegistry/$appsRepoDir/frontend"
 
 [ -n "${KIND_TMP_DIR:-}" ] && cd "$KIND_TMP_DIR"
 
+## phase 2.4.1.1 prepare&push Flux ControlPlane D2 reference architecture fleet repo
 rm -rf "$fleetRepoDir"; git clone "https://github.com/$fluxOrg/$fleetRepoDir"
-mkdir -p "$fluxTransformersDir"
-cat >            "$fluxTransformersDir/kustomization.yaml" <<<"$fluxRegistryTranformers"
-cat >>           "$fluxNamespaceDir/kustomization.yaml"    <<<"$fluxInstancePatch"
-_autoKustomizate "$fleetRepoDir/$fluxStageDir"             <<<"$fluxStagingPatch"
-_autoKustomizate "$fleetRepoDir/tenants"                   <<<"$fluxTenantsPatch"
-(cd "$fluxNamespaceDir"; git add .; git commit -m 'chore: add patch for localizing OCI registry')
+mkdir -p "$fleetTransformersDir"
+cat >            "$fleetTransformersDir/kustomization.yaml" <<<"$fluxRegistryTranformers"
+cat >>           "$fluxNamespaceDir/kustomization.yaml"     <<<"$fluxInstancePatch"
+_autoKustomizate "$fleetRepoDir/$fluxStageDir"              <<<"$fluxStagingPatch"
+_autoKustomizate "$fleetRepoDir/tenants"                    <<<"$fluxTenantsPatch"
+(cd "$fluxNamespaceDir"; git add .; git commit -m 'chore: add patch for localizing fleet OCI registry')
 
-$fluxPush "oci://$localFleetUrl" --path "$fleetRepoDir" --source "https://$localFleetUrl" \
-          "--revision=$(cd "$fleetRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
+fleetGitRev="$(cd "$fleetRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
+$fluxPush "--revision=$fleetGitRev" "oci://$localFleetUrl" \
+          --path "$fleetRepoDir" --source "https://$localFleetUrl"
 
+## phase 2.4.1.2 prepare&push Flux ControlPlane D2 reference architecture infra repo
 rm -rf "$infraRepoDir"; git clone "https://github.com/$fluxOrg/$infraRepoDir"
-cat >> "$infraRepoDir/components/cert-manager/controllers/base/kustomization.yaml" <<<"$infraHelmReleasePatch"
-cat >> "$infraRepoDir/components/monitoring/controllers/base/kustomization.yaml"   <<<"$infraHelmReleasePatch"
-(cd "$infraRepoDir"; git add .; git commit -m 'chore: add patch for increasing HelmRelease CR timeouts')
+_chartCopy "$infraCompDir/cert-manager/controllers/staging" "$infraCompDir/monitoring/controllers/staging"
+cat >> "$infraCompDir/cert-manager/controllers/base/kustomization.yaml" <<<"$infraHelmReleasePatch"
+cat >> "$infraCompDir/monitoring/controllers/base/kustomization.yaml"   <<<"$infraHelmReleasePatch"
+cat >> "$infraCompDir/cert-manager/controllers/base/kustomization.yaml" <<<"$airGapPatch"
+cat >> "$infraCompDir/monitoring/controllers/base/kustomization.yaml"   <<<"$airGapPatch"
+(cd "$infraRepoDir"; git add .; git commit -m 'chore: add patch for infra HelmRelease and OCIRepository CRs')
 
-$fluxPush "oci://$localInfraCertManagerUrl" --path "$infraRepoDir/components/cert-manager" --source "https://$localInfraCertManagerUrl" \
-          "--revision=$(cd "$infraRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
-$fluxPush "oci://$localInfraMonitoringUrl" --path "$infraRepoDir/components/monitoring" --source "https://$localInfraMonitoringUrl" \
-          "--revision=$(cd "$infraRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
+infraGitRev="$(cd "$infraRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
+$fluxPush "--revision=$infraGitRev" "oci://$localInfraCertManagerUrl" \
+          --source "https://$localInfraCertManagerUrl" --path "$infraCompDir/cert-manager"
+$fluxPush "--revision=$infraGitRev" "oci://$localInfraMonitoringUrl" \
+          --source "https://$localInfraMonitoringUrl" --path "$infraCompDir/monitoring"
 
-## phase 2.4.1 bootstrap Flux ControlPlane operator via Helm
+## phase 2.4.1.3 prepare&push Flux ControlPlane D2 reference architecture apps repo
+rm -rf "$appsRepoDir"; git clone "https://github.com/$fluxOrg/$appsRepoDir"
+_chartCopy "$appsCompDir/backend/staging" "$appsCompDir/frontend/staging"
+cat >> "$appsCompDir/backend/base/kustomization.yaml"  <<<"$airGapPatch"
+cat >> "$appsCompDir/frontend/base/kustomization.yaml" <<<"$airGapPatch"
+(cd "$appsRepoDir"; git add .; git commit -m 'chore: add patch for redirecting apps repo OCIRepository CRs to proxy')
+
+appsGitRev="$(cd "$appsRepoDir" && printf '%s-%s' "$(git branch --show-current)" "$(git rev-parse HEAD)")"
+$fluxPush "--revision=$appsGitRev" "oci://$localAppsBackendUrl" \
+          --source "https://$localAppsBackendUrl" --path "$appsCompDir/backend"
+$fluxPush "--revision=$appsGitRev" "oci://$localAppsFrontendUrl" \
+          --source "https://$localAppsFrontendUrl" --path "$appsCompDir/frontend"
+
+## phase 2.4.2 bootstrap Flux ControlPlane operator via Helm
 kubectl create namespace "$fluxNamespace"
 kubectl label namespace "$fluxNamespace" 'istio-injection=enabled'
 helm delete  -n "$fluxNamespace" --wait --cascade orphan --ignore-not-found flux-operator # try to act idempotent
@@ -686,11 +751,11 @@ helm install -n "$fluxNamespace" --wait --plain-http --create-namespace --replac
              -f "$fleetRepoDir/$fluxStageDir/$fluxNamespace/flux-operator-values.yaml" \
              flux-operator "oci://$localRegistry/$operatorChart"
 
-## phase 2.4.2 bootstrap Flux ControlPlane FluxInstance CR patched for Kind
+## phase 2.4.3 bootstrap Flux ControlPlane FluxInstance CR patched for Kind
 kubectl -n "$fluxNamespace" apply -k "$fluxNamespaceDir" -o 'jsonpath={.items[?(@.kind=="FluxInstance")]}' | jq .spec
 kubectl -n "$fluxNamespace" wait fluxinstance/flux --for=condition=Ready --timeout=15m
 
-## phase 2.4.3 expose Flux operator web UI via Istio
+## phase 2.4.4 expose Flux operator web UI via Istio
 tee "${KIND_GITOLITE_DEPLOY_DEBUG:-/dev/stderr}" <<-EOF | kubectl -n "$fluxNamespace" apply -f -
 apiVersion: networking.istio.io/v1
 kind: VirtualService
