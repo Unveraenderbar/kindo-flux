@@ -39,7 +39,7 @@ gitIsRepoUnchanged() {
 
 # FluxCD related parameters:
 fluxNamespace="${KIND_FLUX_NAMESPACE:-flux-system}"
-fluxVersion="${FLUX_VERSION:-2.9.2}"
+fluxVersion="${FLUX_VERSION:-2.9.5}"
 fluxUrl="${GITHUB_PROXY_URL:-https://github.com}/fluxcd/flux2/releases/download/v$fluxVersion/flux_${fluxVersion}_linux_amd64.tar.gz"
 gitoliteFluxKeyFile="${GITOSSH_FLUX_KEY_FILE:-$KIND_TMP_DIR/$fluxNamespace.ecdsa}"
 gitoliteFluxPubKeyFile="$gitoliteAdminClone/keydir/$fluxNamespace.pub"
@@ -691,7 +691,7 @@ set -ex
 ## phase 2.4.1 prepare Flux ControlPlane OCI images patched for Kind / air-gapped platform:
 
 # emulate pseudo-air-gap for reference architecture OCI artifacts (other artifacts/images are still pulled from GitHub registry):
-_localCopy "$remoteRegistryHost/$operatorChart" "${OPERATOR_CHART_VERSION:-0.55.0}"
+_localCopy "$remoteRegistryHost/$operatorChart" "${OPERATOR_CHART_VERSION:-0.59.0}"
 _localCopy "$remoteRegistry/flux-operator-manifests"
 
 #_localCopy "$remoteRegistry/$fleetRepoDir"              # transformed below...

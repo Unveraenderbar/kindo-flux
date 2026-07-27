@@ -41,7 +41,7 @@ gitIsRepoUnchanged() {
 # FluxCD related parameters:
 fluxNamespace="${KIND_FLUX_NAMESPACE:-flux-system}"
 fluxBootNamespace="${KIND_FLUX_BOOT_NAMESPACE:-flux-bootstrap}"
-fluxVersion="${FLUX_VERSION:-2.9.2}"
+fluxVersion="${FLUX_VERSION:-2.9.5}"
 fluxUrl="https://github.com/fluxcd/flux2/releases/download/v$fluxVersion/flux_${fluxVersion}_linux_amd64.tar.gz"
 gitoliteFluxKeyFile="${GITOSSH_FLUX_KEY_FILE:-$KIND_TMP_DIR/$fluxNamespace.ecdsa}"
 gitoliteFluxPubKeyFile="$gitoliteAdminClone/keydir/$fluxNamespace.pub"
@@ -282,7 +282,7 @@ nodes:
     protocol: TCP
 $(seq 1 "${KIND_NUM_NODES:-2}" | xargs -rn1 sh -c "printf -- \"- role: worker\n\"")
 EOF
-$sudo sh -exc "kind delete cluster --name $clusterName || true
+$sudo sh -exc "$kindCmd delete cluster --name $clusterName || true
                podman rm --filter name=$clusterName
                $kindCmd create cluster --image $kindImage --config $kindConfig
                $kindCmd export kubeconfig --kubeconfig=$kubeConfig --name $clusterName
