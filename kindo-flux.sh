@@ -628,6 +628,7 @@ spec:
     - '--url=ssh://git@$k8sSshSvcName:$opensshPort/$fluxNamespace'
     # flux aborts w/o error message if started w/o silent option!
     command: ['flux', 'bootstrap', 'git', '--silent', '--branch', 'master', '--interval', '1m']
+    env: [{'name': 'https_proxy', value: ''}, {'name': 'HTTPS_PROXY', value: ''}] # might block connection to API server from within pod
     image: $gitosshImg
     imagePullPolicy: Never
     name: $fluxBootNamespace
