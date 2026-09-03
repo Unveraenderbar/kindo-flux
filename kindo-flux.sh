@@ -121,7 +121,7 @@ fluxAddComponent() {( # run in sub-shell to isolate git SSH command / working di
     componentSubDir="clusters/$clusterName/$1"
     mkdir -p "$fluxCloneDir/$componentSubDir"
     cd "$fluxCloneDir/$componentSubDir"
-    eval "${7:-wget -O- \"$2\"}" > "$1-components.yaml"
+    eval "${7:-curl -Lo \"$1-components.yaml\" \"$2\"}"
     if ! gitIsRepoUnchanged; then
         git add .; git commit -m "Add $3 for kind manifests"; git push
     fi
@@ -231,8 +231,8 @@ if [ -z "$(podman images --noheading "$gitosshImg")" ]; then # trigger rebuild o
             "apk update; apk upgrade; apk add ${GITOSSH_PKGS:-git perl gitolite openssl}
              sed -i -e 's/ \(2222\)/ \${OPENSSH_PORT:-\1}/' /etc/s6-overlay/s6-rc.d/svc-openssh-server/run
              usermod -u $gitoliteUid -g $gitoliteGid $gitoliteUser
-             wget -O- $fluxUrl | tar -oxzf - -C /usr/local/bin flux
-             wget -O    /usr/bin/kubectl $kubectlUrl
+             curl -L $fluxUrl | tar -oxzf - -C /usr/local/bin flux
+             curl -Lo /usr/bin/kubectl $kubectlUrl
              chmod 0555 /usr/bin/kubectl"
     buildah commit --rm "$gitosshName" "$gitosshImg"
 fi
